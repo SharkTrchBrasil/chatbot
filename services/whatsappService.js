@@ -1,11 +1,11 @@
-// services/whatsappService.js
-// VERSÃO CORRIGIDA: Funções duplicadas removidas e importações corrigidas.
-
 import makeWASocket, {
     DisconnectReason,
-    // ✅ NOVO: Importar a função de autenticação nativa do Baileys
-    AuthenticationFromDB
+    downloadMediaMessage,
+    makeCacheStore,
+    type AuthenticationState
 } from '@whiskeysockets/baileys';
+
+
 import qrcode from 'qrcode-terminal';
 import { notifyFastAPI } from '../utils/notifications.js';
 import { processMessage } from '../controllers/chatbotController.js';
@@ -105,12 +105,35 @@ const startSession = async (sessionId, phoneNumber, method) => {
         sessionMethods.set(String(sessionId), method);
     }
 
-    console.log(`[SESSION ${sessionId}] Starting connection process using method: "${method}"...`);
+console.log(`[SESSION ${sessionId}] Starting connection process using method: "${method}"...`);
 
-    const { state, saveCreds, clearCreds } = AuthenticationFromDB(sessionId, authDB, createLogger(sessionId));
+    // ✅ MUDANÇA CRÍTICA: Construindo o 'auth' state manualmente
+    const store = {
+        read: (key) => authDB.read(sessionId, key),
+        write: (key, value) => authDB.write(sessionId, key, value),
+        remove: (key) => authDB.remove(sessionId, key),
+    };
+
+    const authState: AuthenticationState = {
+        creds: undefined, // Será carregado pelo readCreds
+        keys: makeCacheStore({
+            read: store.read,
+            write: store.write,
+            remove: store.remove
+        }),
+        saveCreds: (creds) => store.write('creds', creds),
+        readCreds: () => store.read('creds'),
+        removeCreds: () => store.remove('creds'),
+    };
+
+    // Carrega as credenciais iniciais do DB
+    const initialCreds = await authState.readCreds();
+    if (initialCreds) {
+        authState.creds = initialCreds;
+    }
 
     const waSocket = makeWASocket({
-        auth: state,
+        auth: authState, // ✅ Passa o objeto de estado completo
         printQRInTerminal: method === 'qr',
         browser: ['PDVix Platform', 'Chrome', '1.0.0'],
         logger: createLogger(sessionId),
@@ -120,10 +143,14 @@ const startSession = async (sessionId, phoneNumber, method) => {
         keepAliveIntervalMs: 30000,
     });
 
+    // ✅ A função 'clearCreds' agora é a do seu authDB
+    const clearCreds = () => authDB.clearAll(sessionId);
+
     activeSessions.set(String(sessionId), { sock: waSocket, method, status: 'connecting', clearCreds });
     const isPlatformBot = sessionId === PLATFORM_BOT_ID;
 
-    waSocket.ev.on('creds.update', saveCreds);
+    // ✅ O 'creds.update' é acionado pelo 'saveCreds'
+    waSocket.ev.on('creds.update', authState.saveCreds);
 
     waSocket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
