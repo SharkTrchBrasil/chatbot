@@ -1,0 +1,34 @@
+# Arquivo de log de dependências
+package-lock.json
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Diretório de dependências do Node.js
+# ESSA É A PASTA MAIS IMPORTANTE A SER IGNORADA
+node_modules/
+sessions/
+
+# Pasta de sessão do whatsapp-web.js
+# Contém dados de autenticação e não deve ir para o repositório
+.wwebjs_auth/
+
+# Arquivos de ambiente - NUNCA ENVIE SUAS SENHAS E CHAVES!
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Configurações de IDEs
+.vscode/
+.idea/
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db

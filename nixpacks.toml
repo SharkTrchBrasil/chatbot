@@ -1,0 +1,5 @@
+# nixpacks.toml
+
+[start]
+# O comando para iniciar sua aplicação
+cmd = "npm start"
