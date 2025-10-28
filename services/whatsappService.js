@@ -5,7 +5,7 @@ import makeWASocket, {
     type AuthenticationState
 } from '@whiskeysockets/baileys';
 
-
+import { getStoresToReconnect, updateConversationMetadata } from './chatbotService.js';
 import qrcode from 'qrcode-terminal';
 import { notifyFastAPI } from '../utils/notifications.js';
 import { processMessage } from '../controllers/chatbotController.js';
@@ -232,6 +232,15 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
     waSocket.ev.on('messages.upsert', async (m) => {
         const receivedMessages = m.messages;
         for (const msg of receivedMessages) {
+
+
+                if (!isPlatformBot && msg.message) {
+                    updateConversationMetadata(sessionId, msg);
+                }
+
+
+
+
             if (msg.key.fromMe || !msg.message) continue;
 
             const chatId = msg.key.remoteJid;
