@@ -1,16 +1,10 @@
-// utils/forwarder.js - VERSÃO ROBUSTA COM RETRY E DLQ
+// utils/forwarder.js - VERSÃO CORRIGIDA E SEGURA
 
 import axios from 'axios';
 import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { Blob } from 'buffer';
 import FormData from 'form-data';
-import pg from 'pg';
-
-const { Pool } = pg;
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-});
+import pool from '../config/database.js'; // ✅ CORREÇÃO: Usar pool centralizado
 
 // ✅ Whitelist de mimetypes permitidos
 const ALLOWED_MIMETYPES = [
@@ -24,13 +18,26 @@ const ALLOWED_MIMETYPES = [
     'text/plain'
 ];
 
+// ✅ Constantes de configuração
+const MAX_MEDIA_SIZE = 16 * 1024 * 1024; // 16MB
+const MAX_RETRIES = 3;
+const BASE_DELAY = 2000;
+const MEDIA_DOWNLOAD_TIMEOUT = 30000;
+const REQUEST_TIMEOUT = 30000;
+
 // ✅ NOVA: Função para salvar em Dead Letter Queue
 const saveToDLQ = async (storeId, msg, error) => {
     try {
         const query = `
             INSERT INTO message_dlq
-            (store_id, message_uid, chat_id, payload, error_message, created_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+            (store_id, message_uid, chat_id, payload, error_message, retry_count, next_retry_at)
+            VALUES ($1, $2, $3, $4, $5, 0, NOW() + INTERVAL '5 minutes')
+            ON CONFLICT (store_id, message_uid)
+            DO UPDATE SET
+                error_message = EXCLUDED.error_message,
+                retry_count = message_dlq.retry_count + 1,
+                next_retry_at = NOW() + INTERVAL '5 minutes' * (message_dlq.retry_count + 1),
+                updated_at = NOW()
         `;
 
         await pool.query(query, [
@@ -44,20 +51,22 @@ const saveToDLQ = async (storeId, msg, error) => {
         console.log(`[DLQ] ✅ Message ${msg.key.id} saved for retry`);
         return true;
     } catch (dlqErr) {
-        console.error(`[DLQ] ❌ CRITICAL: Failed to save to DLQ:`, dlqErr);
+        console.error(`[DLQ] ❌ CRITICAL: Failed to save to DLQ:`, dlqErr.message);
         return false;
     }
 };
 
-// ✅ NOVA: Função auxiliar para retry com backoff exponencial
-const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
+// ✅ Função auxiliar para retry com backoff exponencial
+const retryWithBackoff = async (fn, maxRetries = MAX_RETRIES, baseDelay = BASE_DELAY) => {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             return await fn();
         } catch (error) {
             const isLastAttempt = attempt === maxRetries;
             const isServerError = error.response?.status >= 500;
-            const isNetworkError = error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT';
+            const isNetworkError = error.code === 'ECONNREFUSED' ||
+                                  error.code === 'ETIMEDOUT' ||
+                                  error.code === 'ENOTFOUND';
 
             // ✅ Não fazer retry em erros de cliente (4xx)
             if (error.response?.status >= 400 && error.response?.status < 500) {
@@ -80,20 +89,22 @@ const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
     }
 };
 
-// ✅ NOVA: Validar e sanitizar filename
+// ✅ Validar e sanitizar filename
 const sanitizeFilename = (filename) => {
     if (!filename) return 'file';
 
     return filename
         .replace(/[^a-zA-Z0-9._-]/g, '_') // Remove caracteres especiais
         .replace(/\.{2,}/g, '.') // Remove múltiplos pontos
+        .replace(/^\.+/, '') // Remove pontos no início
         .substring(0, 255); // Limitar tamanho
 };
 
-// ✅ NOVA: Validar mimetype
+// ✅ Validar mimetype
 const isAllowedMimetype = (mimetype) => {
     if (!mimetype) return false;
-    return ALLOWED_MIMETYPES.some(allowed => mimetype.toLowerCase().startsWith(allowed));
+    const normalizedMime = mimetype.toLowerCase().split(';')[0].trim();
+    return ALLOWED_MIMETYPES.some(allowed => normalizedMime === allowed.toLowerCase());
 };
 
 /**
@@ -141,8 +152,8 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
 
         // ✅ CORREÇÃO: sender_id com fallback seguro
         const senderId = msg.key.fromMe
-            ? waSocket.user.id.split(':')[0] // Usar apenas número, sem @s.whatsapp.net
-            : (msg.key.participant || msg.key.remoteJid);
+            ? waSocket.user.id.split(':')[0] // Usar apenas número
+            : (msg.key.participant || msg.key.remoteJid).split('@')[0];
 
         form.append('store_id', String(storeId));
         form.append('chat_id', msg.key.remoteJid);
@@ -164,8 +175,6 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
             // ✅ SEGURANÇA: Validar mimetype
             if (!isAllowedMimetype(mimetype)) {
                 console.warn(`[FORWARDER] ⚠️ Blocked unsafe mimetype: ${mimetype} for message ${msg.key.id}`);
-
-                // ✅ Enviar apenas metadata sem mídia
                 form.append('media_blocked', 'true');
                 form.append('blocked_mimetype', mimetype);
             } else {
@@ -174,26 +183,25 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
                     const mediaBuffer = await Promise.race([
                         downloadMediaMessage(msg, 'buffer', {}),
                         new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('Media download timeout')), 30000)
+                            setTimeout(() => reject(new Error('Media download timeout')), MEDIA_DOWNLOAD_TIMEOUT)
                         )
                     ]);
 
-                    let finalFilename = 'file';
-
-                    if (contentType === 'document' && mediaMessage.fileName) {
-                        finalFilename = sanitizeFilename(mediaMessage.fileName);
-                    } else {
-                        const extension = mimetype.split('/')[1]?.split(';')[0] || 'bin';
-                        finalFilename = sanitizeFilename(`${contentType}-${msg.key.id}.${extension}`);
-                    }
-
-                    // ✅ SEGURANÇA: Limitar tamanho do arquivo (16MB)
-                    const maxSize = 16 * 1024 * 1024;
-                    if (mediaBuffer.length > maxSize) {
-                        console.warn(`[FORWARDER] ⚠️ Media too large: ${mediaBuffer.length} bytes. Max: ${maxSize}`);
+                    // ✅ SEGURANÇA: Validar tamanho
+                    if (mediaBuffer.length > MAX_MEDIA_SIZE) {
+                        console.warn(`[FORWARDER] ⚠️ Media too large: ${mediaBuffer.length} bytes`);
                         form.append('media_too_large', 'true');
                         form.append('media_size', String(mediaBuffer.length));
                     } else {
+                        let finalFilename = 'file';
+
+                        if (contentType === 'document' && mediaMessage.fileName) {
+                            finalFilename = sanitizeFilename(mediaMessage.fileName);
+                        } else {
+                            const extension = mimetype.split('/')[1]?.split(';')[0] || 'bin';
+                            finalFilename = sanitizeFilename(`${contentType}-${Date.now()}.${extension}`);
+                        }
+
                         form.append('media_filename_override', finalFilename);
                         form.append('media_mimetype_override', mimetype);
 
@@ -215,8 +223,8 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
                     'x-webhook-secret': CHATBOT_WEBHOOK_SECRET,
                     ...form.getHeaders()
                 },
-                timeout: 30000, // 30 segundos
-                maxContentLength: 20 * 1024 * 1024, // 20MB
+                timeout: REQUEST_TIMEOUT,
+                maxContentLength: 20 * 1024 * 1024,
                 maxBodyLength: 20 * 1024 * 1024
             });
 
@@ -225,7 +233,7 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
             }
 
             return response;
-        }, 3, 2000); // 3 tentativas, 2s de delay base
+        });
 
         console.log(`[FORWARDER] ✅ Message ${msg.key.id} forwarded successfully`);
 
@@ -235,7 +243,7 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
         if (error.response) {
             console.error('[FORWARDER] Server response:', {
                 status: error.response.status,
-                data: error.response.data
+                data: JSON.stringify(error.response.data).substring(0, 200)
             });
         }
 
@@ -249,10 +257,10 @@ export const forwardMessageToFastAPI = async (storeId, msg, waSocket) => {
 };
 
 // ✅ NOVA: Função para processar mensagens da DLQ
-export const processMessageDLQ = async () => {
+export const processMessageDLQ = async (getSocketForStore) => {
     try {
         const query = `
-            SELECT id, store_id, message_uid, payload
+            SELECT id, store_id, message_uid, payload, retry_count
             FROM message_dlq
             WHERE retry_count < 5
             AND next_retry_at <= NOW()
@@ -273,9 +281,16 @@ export const processMessageDLQ = async () => {
                 const msg = JSON.parse(row.payload);
                 const storeId = row.store_id;
 
+                // ✅ Obter socket da sessão ativa
+                const waSocket = getSocketForStore(storeId);
+
+                if (!waSocket) {
+                    console.warn(`[DLQ] Session not active for store ${storeId}. Skipping.`);
+                    continue;
+                }
+
                 // ✅ Tentar reenviar
-                // Nota: Você precisará obter o waSocket da sessão ativa
-                // await forwardMessageToFastAPI(storeId, msg, getSocketForStore(storeId));
+                await forwardMessageToFastAPI(storeId, msg, waSocket);
 
                 // ✅ Remover da DLQ se sucesso
                 await pool.query('DELETE FROM message_dlq WHERE id = $1', [row.id]);
@@ -286,8 +301,9 @@ export const processMessageDLQ = async () => {
                 await pool.query(`
                     UPDATE message_dlq
                     SET retry_count = retry_count + 1,
-                        next_retry_at = NOW() + INTERVAL '5 minutes',
-                        last_error = $1
+                        next_retry_at = NOW() + INTERVAL '5 minutes' * (retry_count + 2),
+                        error_message = $1,
+                        updated_at = NOW()
                     WHERE id = $2
                 `, [retryError.message, row.id]);
 
@@ -295,19 +311,45 @@ export const processMessageDLQ = async () => {
             }
         }
     } catch (error) {
-        console.error('[DLQ] ❌ Error processing DLQ:', error);
+        console.error('[DLQ] ❌ Error processing DLQ:', error.message);
+    }
+};
+
+// ✅ NOVA: Cleanup de mensagens antigas da DLQ
+export const cleanupOldDLQMessages = async () => {
+    try {
+        const result = await pool.query(`
+            DELETE FROM message_dlq
+            WHERE (retry_count >= 5 AND created_at < NOW() - INTERVAL '7 days')
+               OR created_at < NOW() - INTERVAL '30 days'
+        `);
+
+        if (result.rowCount > 0) {
+            console.log(`[DLQ] 🗑️ Cleaned up ${result.rowCount} old messages`);
+        }
+    } catch (error) {
+        console.error('[DLQ] ❌ Cleanup failed:', error.message);
     }
 };
 
 // ✅ NOVA: Iniciar processamento periódico da DLQ
-export const startDLQProcessor = () => {
-    const INTERVAL = 5 * 60 * 1000; // 5 minutos
+export const startDLQProcessor = (getSocketForStore) => {
+    const PROCESS_INTERVAL = 5 * 60 * 1000; // 5 minutos
+    const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 horas
 
+    // Processar DLQ a cada 5 minutos
     setInterval(() => {
-        processMessageDLQ().catch(err => {
-            console.error('[DLQ] Processor error:', err);
+        processMessageDLQ(getSocketForStore).catch(err => {
+            console.error('[DLQ] Processor error:', err.message);
         });
-    }, INTERVAL);
+    }, PROCESS_INTERVAL);
 
-    console.log('[DLQ] ✅ Processor started (interval: 5min)');
+    // Cleanup a cada 24 horas
+    setInterval(() => {
+        cleanupOldDLQMessages().catch(err => {
+            console.error('[DLQ] Cleanup error:', err.message);
+        });
+    }, CLEANUP_INTERVAL);
+
+    console.log('[DLQ] ✅ Processor started (process: 5min, cleanup: 24h)');
 };

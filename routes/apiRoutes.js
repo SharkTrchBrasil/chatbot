@@ -1,6 +1,7 @@
 // routes/apiRoutes.js - VERSÃO SEGURA COM RATE LIMITING AVANÇADO
 
 import express from 'express';
+import crypto from 'crypto'; // ✅ CORREÇÃO: Import adicionado
 import rateLimit from 'express-rate-limit';
 import whatsappService from '../services/whatsappService.js';
 import { body, param, validationResult } from 'express-validator';
@@ -16,22 +17,28 @@ const verifySecret = (req, res, next) => {
         return res.status(403).json({ error: 'Unauthorized access' });
     }
 
-    // ✅ Timing-safe comparison para prevenir timing attacks
-    const receivedBuffer = Buffer.from(receivedSecret);
-    const expectedBuffer = Buffer.from(CHATBOT_WEBHOOK_SECRET);
+    try {
+        // ✅ Timing-safe comparison para prevenir timing attacks
+        const receivedBuffer = Buffer.from(receivedSecret);
+        const expectedBuffer = Buffer.from(CHATBOT_WEBHOOK_SECRET);
 
-    if (receivedBuffer.length !== expectedBuffer.length) {
+        if (receivedBuffer.length !== expectedBuffer.length) {
+            return res.status(403).json({ error: 'Unauthorized access' });
+        }
+
+        const isValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
+
+        if (!isValid) {
+            return res.status(403).json({ error: 'Unauthorized access' });
+        }
+
+        next();
+    } catch (error) {
+        console.error('[AUTH] Secret verification error:', error.message);
         return res.status(403).json({ error: 'Unauthorized access' });
     }
-
-    const isValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
-
-    if (!isValid) {
-        return res.status(403).json({ error: 'Unauthorized access' });
-    }
-
-    next();
 };
+
 
 // ✅ SEGURANÇA: Rate limiter por loja
 const createStoreLimiter = (max, windowMs) => rateLimit({
