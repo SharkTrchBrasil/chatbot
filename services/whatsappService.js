@@ -1,21 +1,16 @@
 import makeWASocket, {
     DisconnectReason,
     downloadMediaMessage,
-    makeCacheStore,
-    type AuthenticationState
+    useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 
 import { getStoresToReconnect, updateConversationMetadata } from './chatbotService.js';
 import qrcode from 'qrcode-terminal';
 import { notifyFastAPI } from '../utils/notifications.js';
 import { processMessage } from '../controllers/chatbotController.js';
-import { getStoresToReconnect } from './chatbotService.js';
-import { Blob } from 'buffer';
-
-// ✅ CORREÇÃO: Importa o forwarder real para quebrar a dependência
 import { forwardMessageToFastAPI } from '../utils/forwarder.js';
 
-// ✅ NOVO: Conectar ao banco de dados diretamente aqui.
+// Conectar ao banco de dados
 import pg from 'pg';
 const { Pool } = pg;
 const pool = new Pool({
@@ -26,13 +21,49 @@ const pool = new Pool({
 const activeSessions = new Map();
 const PLATFORM_BOT_ID = 'platform';
 
-// ✅ ESTADO CENTRALIZADO (Ver Auditoria de Escalabilidade)
+// Estado centralizado de conversação
 export const conversationState = {};
 export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000;
 
 const sessionMethods = new Map();
 
-// ✅ NOVO: Lógica de autenticação para o Baileys v7
+// ✅ Implementação de Auth State customizado para o banco de dados
+const createAuthStateFromDB = (sessionId) => {
+    return {
+        state: {
+            creds: undefined,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        const key = `${type}-${id}`;
+                        const value = await authDB.read(sessionId, key);
+                        if (value) data[id] = value;
+                    }
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            tasks.push(authDB.write(sessionId, key, value));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: async () => {
+            if (authStateFromDB.state.creds) {
+                await authDB.write(sessionId, 'creds', authStateFromDB.state.creds);
+            }
+        }
+    };
+};
+
+// Operações de autenticação no banco de dados
 const authDB = {
     read: async (sessionId, key) => {
         try {
@@ -54,7 +85,7 @@ const authDB = {
                 INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (session_id, cred_id)
-                DO UPDATE SET cred_value = EXCLUDED.cred_value;
+                DO UPDATE SET cred_value = EXCLUDED.cred_value, updated_at = CURRENT_TIMESTAMP;
             `;
             await pool.query(query, [sessionId, key, valueStr]);
         } catch (e) {
@@ -80,6 +111,7 @@ const authDB = {
     }
 };
 
+// Logger customizado
 const createLogger = (sessionId) => {
     const logger = {
         level: 'silent',
@@ -93,6 +125,7 @@ const createLogger = (sessionId) => {
     return logger;
 };
 
+// Iniciar sessão do WhatsApp
 const startSession = async (sessionId, phoneNumber, method) => {
     if (activeSessions.has(String(sessionId))) {
         console.log(`[SESSION ${sessionId}] Session already in progress. Ignoring duplicate start.`);
@@ -105,35 +138,19 @@ const startSession = async (sessionId, phoneNumber, method) => {
         sessionMethods.set(String(sessionId), method);
     }
 
-console.log(`[SESSION ${sessionId}] Starting connection process using method: "${method}"...`);
+    console.log(`[SESSION ${sessionId}] Starting connection process using method: "${method}"...`);
 
-    // ✅ MUDANÇA CRÍTICA: Construindo o 'auth' state manualmente
-    const store = {
-        read: (key) => authDB.read(sessionId, key),
-        write: (key, value) => authDB.write(sessionId, key, value),
-        remove: (key) => authDB.remove(sessionId, key),
-    };
+    // ✅ CORREÇÃO: Criar auth state customizado
+    const { state, saveCreds } = createAuthStateFromDB(sessionId);
 
-    const authState: AuthenticationState = {
-        creds: undefined, // Será carregado pelo readCreds
-        keys: makeCacheStore({
-            read: store.read,
-            write: store.write,
-            remove: store.remove
-        }),
-        saveCreds: (creds) => store.write('creds', creds),
-        readCreds: () => store.read('creds'),
-        removeCreds: () => store.remove('creds'),
-    };
-
-    // Carrega as credenciais iniciais do DB
-    const initialCreds = await authState.readCreds();
-    if (initialCreds) {
-        authState.creds = initialCreds;
+    // Carregar credenciais do banco
+    const savedCreds = await authDB.read(sessionId, 'creds');
+    if (savedCreds) {
+        state.creds = savedCreds;
     }
 
     const waSocket = makeWASocket({
-        auth: authState, // ✅ Passa o objeto de estado completo
+        auth: state,
         printQRInTerminal: method === 'qr',
         browser: ['PDVix Platform', 'Chrome', '1.0.0'],
         logger: createLogger(sessionId),
@@ -143,15 +160,22 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
         keepAliveIntervalMs: 30000,
     });
 
-    // ✅ A função 'clearCreds' agora é a do seu authDB
     const clearCreds = () => authDB.clearAll(sessionId);
 
-    activeSessions.set(String(sessionId), { sock: waSocket, method, status: 'connecting', clearCreds });
+    activeSessions.set(String(sessionId), {
+        sock: waSocket,
+        method,
+        status: 'connecting',
+        clearCreds,
+        isActive: true
+    });
+
     const isPlatformBot = sessionId === PLATFORM_BOT_ID;
 
-    // ✅ O 'creds.update' é acionado pelo 'saveCreds'
-    waSocket.ev.on('creds.update', authState.saveCreds);
+    // Salvar credenciais quando atualizadas
+    waSocket.ev.on('creds.update', saveCreds);
 
+    // Gerenciar conexão
     waSocket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         const session = activeSessions.get(String(sessionId));
@@ -164,7 +188,7 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
                 notifyFastAPI({
                     storeId: sessionId,
                     status: 'connected',
-                    whatsappName: waSocket.user.name,
+                    whatsappName: waSocket.user?.name || 'Unknown',
                     isActive: true
                 });
             }
@@ -213,6 +237,7 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
         }
     });
 
+    // Solicitar código de pareamento se necessário
     if (method === 'pairing' && phoneNumber) {
         try {
             console.log(`[SESSION ${sessionId}] Requesting pairing code for ${phoneNumber}...`);
@@ -224,39 +249,33 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
         } catch (e) {
             console.error(`[SESSION ${sessionId}] CRITICAL: Failed to request pairing code.`, e);
             waSocket.end();
-            if(clearCreds) await clearCreds();
+            await clearCreds();
             notifyFastAPI({ storeId: sessionId, status: 'error' });
         }
     }
 
+    // Processar mensagens recebidas
     waSocket.ev.on('messages.upsert', async (m) => {
         const receivedMessages = m.messages;
         for (const msg of receivedMessages) {
-
-
-                if (!isPlatformBot && msg.message) {
-                    updateConversationMetadata(sessionId, msg);
-                }
-
-
-
+            if (!isPlatformBot && msg.message) {
+                updateConversationMetadata(sessionId, msg);
+            }
 
             if (msg.key.fromMe || !msg.message) continue;
 
             const chatId = msg.key.remoteJid;
 
-            // ✅ CORREÇÃO: Pega o estado do 'conversationState' exportado
+            // Verificar se o chat está pausado para suporte humano
             const state = conversationState[chatId];
 
             if (state && state.humanSupportUntil && new Date() < new Date(state.humanSupportUntil)) {
                 console.log(`[SESSION ${sessionId}] Chat ${chatId} is paused for human support. Skipping AI response.`);
                 continue;
             }
-            if (!isPlatformBot) {
-                // ✅ CORREÇÃO: Passa o 'waSocket' e o 'sessionId' corretos
-                // A função 'processMessage' agora espera 'state' como parâmetro
 
-                // Garante que o estado exista
+            if (!isPlatformBot) {
+                // Garantir que o estado exista
                 if (!conversationState[chatId]) {
                     conversationState[chatId] = {};
                 }
@@ -267,6 +286,7 @@ console.log(`[SESSION ${sessionId}] Starting connection process using method: "$
     });
 };
 
+// Desconectar sessão
 const disconnectSession = async (sessionId) => {
     const session = activeSessions.get(String(sessionId));
     if (session?.sock) {
@@ -280,6 +300,7 @@ const disconnectSession = async (sessionId) => {
     }
 };
 
+// Enviar mensagem
 const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename, isPlatform = false) => {
     const logPrefix = isPlatform ? '[PLATFORM BOT]' : `[SESSION ${sessionId}]`;
     const session = activeSessions.get(String(sessionId));
@@ -298,14 +319,13 @@ const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, medi
         } else if (mediaType === 'audio' && mediaUrl) {
             messagePayload = { audio: { url: mediaUrl }, ptt: true };
         } else if (mediaType === 'document' && mediaUrl) {
-             messagePayload = { document: { url: mediaUrl }, fileName: mediaFilename || 'documento.pdf', caption: message };
+            messagePayload = { document: { url: mediaUrl }, fileName: mediaFilename || 'documento.pdf', caption: message };
         } else {
             messagePayload = { text: message };
         }
 
         const result = await session.sock.sendMessage(chatId, messagePayload);
 
-        // ✅ CORREÇÃO: Chama o 'forwardMessageToFastAPI' importado
         if (result && !isPlatform) {
             forwardMessageToFastAPI(sessionId, result, session.sock);
         }
@@ -316,6 +336,7 @@ const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, medi
     }
 };
 
+// Restaurar sessões ativas
 const restoreActiveSessions = async () => {
     console.log('--- Checking for saved sessions to restore ---');
     try {
@@ -329,9 +350,7 @@ const restoreActiveSessions = async () => {
     }
 };
 
-// ❌ FUNÇÃO DUPLICADA 'forwardMessageToFastAPI' REMOVIDA DAQUI
-// ❌ FUNÇÃO DUPLICADA 'shutdown' REMOVIDA DAQUI
-
+// Pausar chat para suporte humano
 const pauseChatForHuman = (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session || !session.sock || !session.sock.user?.id) {
@@ -354,6 +373,7 @@ const pauseChatForHuman = (storeId, chatId) => {
     }
 };
 
+// Obter URL da foto de perfil
 const getProfilePictureUrl = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session || !session.sock || !session.sock.user?.id) {
@@ -370,28 +390,33 @@ const getProfilePictureUrl = async (storeId, chatId) => {
     }
 };
 
+// ✅ CORREÇÃO: Obter nome do contato usando método compatível com Baileys v7
 const getContactName = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session || !session.sock || !session.sock.user?.id) {
         return null;
     }
     try {
-        // Esta função foi depreciada na v7, mas pode funcionar.
-        // O ideal é buscar no 'state' ou usar 'waSocket.contactFetch(chatId)'
-        // Vamos manter por enquanto, mas é um ponto de atenção.
-        const contact = await session.sock.getContactById(chatId);
-        return contact?.name || contact?.notify || contact?.pushName;
+        // Usar onWhatsApp para verificar se o número existe
+        const [result] = await session.sock.onWhatsApp(chatId);
+        if (result && result.exists) {
+            // Retornar o JID como fallback, já que v7 não tem getContactById
+            return result.jid.split('@')[0];
+        }
+        return null;
     } catch (e) {
-        console.log(`[STORE ${storeId}] Could not fetch contact name for ${chatId}.`);
+        console.log(`[STORE ${storeId}] Could not fetch contact info for ${chatId}.`);
         return null;
     }
 };
 
+// Enviar mensagem da plataforma
 const sendPlatformMessage = async (number, message) => {
     console.log(`[PLATFORM BOT] Sending transactional message to ${number}`);
     return await sendMessage(PLATFORM_BOT_ID, number, message, null, null, null, true);
 };
 
+// Desligar servidor gracefully
 const shutdown = async () => {
     console.log('[SHUTTING DOWN] Server received shutdown signal...');
     const promises = [];
