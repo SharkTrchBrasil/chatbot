@@ -1,14 +1,18 @@
-// Crie um novo arquivo de rotas, ex: platformApiRoutes.js, para separar as responsabilidades
+// routes/platformApiRoutes.js - VERSÃO CORRIGIDA E SEGURA
 
 import express from 'express';
-import crypto from 'crypto'; // ✅ ADICIONADO
-import rateLimit from 'express-rate-limit'; // ✅ ADICIONADO
+// ❌ crypto não é mais necessário aqui
+import rateLimit from 'express-rate-limit';
 import whatsappService from '../services/whatsappService.js';
+// ✅ CORREÇÃO: Importar o middleware de segurança centralizado
+import { verifyWebhookSecret } from '../middleware/security.js';
+
 
 const router = express.Router();
-const { CHATBOT_WEBHOOK_SECRET } = process.env;
+// ❌ A variável CHATBOT_WEBHOOK_SECRET não é mais necessária aqui
+// const { CHATBOT_WEBHOOK_SECRET } = process.env;
 
-// ✅ ADICIONADO: Rate Limiter
+// ✅ ADICIONADO: Rate Limiter (Lógica mantida, pois é especializada)
 const platformLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutos
     max: 100, // 100 requisições por IP a cada 15 min
@@ -22,37 +26,12 @@ const platformLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// ✅ CORRIGIDO: Middleware de segurança (Timing-Safe)
-const verifySecret = (req, res, next) => {
-    const receivedSecret = req.headers['x-webhook-secret'];
-
-    if (!receivedSecret || !CHATBOT_WEBHOOK_SECRET) {
-        return res.status(403).json({ error: 'Unauthorized access.' });
-    }
-
-    try {
-        const receivedBuffer = Buffer.from(receivedSecret);
-        const expectedBuffer = Buffer.from(CHATBOT_WEBHOOK_SECRET);
-
-        if (receivedBuffer.length !== expectedBuffer.length) {
-            return res.status(403).json({ error: 'Unauthorized access.' });
-        }
-
-        // Use crypto.timingSafeEqual para prevenir timing attacks
-        const isValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
-
-        if (!isValid) {
-            return res.status(403).json({ error: 'Unauthorized access.' });
-        }
-
-        return next();
-    } catch (error) {
-        return res.status(403).json({ error: 'Unauthorized access.' });
-    }
-};
+// ❌ REMOVIDO: Função 'verifySecret' local duplicada.
+// Estamos importando 'verifyWebhookSecret' do 'security.js'
 
 router.use(platformLimiter); // ✅ APLICAR RATE LIMIT
-router.use(verifySecret); // ✅ APLICAR VERIFICAÇÃO SEGURA
+// ✅ CORREÇÃO: Usando a função importada
+router.use(verifyWebhookSecret);
 
 const PLATFORM_BOT_ID = 'platform';
 

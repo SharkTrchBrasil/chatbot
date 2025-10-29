@@ -1,33 +1,13 @@
-// services/chatbotService.js - VERSÃO CORRIGIDA E REFATORADA
-import pg from 'pg';
-const { Pool } = pg;
-// ❌ REMOVIDO: Todas as importações do Baileys e a classe 'ChatbotSessionManager'
+// services/chatbotService.js - VERSÃO CORRIGIDA E CENTRALIZADA
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-});
+// ✅ CORREÇÃO: Importar as funções de query do módulo de database centralizado
+import { executeQuery, executeQueryMany } from '../config/database.js';
+
+// ❌ REMOVIDO: Importação do 'pg' e criação do 'new Pool()' local.
 
 // --- Funções de Query (Permancem iguais) ---
-const executeQuery = async (query, params = []) => {
-    try {
-        const res = await pool.query(query, params);
-        return res.rows.length ? res.rows[0] : null;
-    } catch (err) {
-        console.error(`Error executing query: ${query}`, err);
-        throw err;
-    }
-};
-
-const executeQueryMany = async (query, params = []) => {
-    try {
-        const res = await pool.query(query, params);
-        return res.rows;
-    } catch (err) {
-        console.error(`Error executing query: ${query}`, err);
-        return [];
-    }
-};
+// ❌ REMOVIDO: Funções locais 'executeQuery' e 'executeQueryMany'.
+// Elas agora são importadas do 'database.js'.
 
 // --- Lógica de Negócios (Agora exportadas) ---
 
@@ -58,6 +38,8 @@ export const getTodaysOrderStatusByPhone = async (storeId, phoneJid) => {
         ORDER BY created_at DESC
         LIMIT 1;
     `;
+
+    // ✅ CORREÇÃO: Usando a função importada
     const result = await executeQuery(query, [storeId, phoneQueryParam]);
 
     if (result) {
@@ -77,21 +59,22 @@ export const getCustomMessage = async (storeId, messageKey) => {
         LEFT JOIN store_chatbot_messages sc ON st.message_key = sc.template_key AND sc.store_id = $1
         WHERE st.message_key = $2;
     `;
+    // ✅ CORREÇÃO: Usando a função importada
     const result = await executeQuery(query, [storeId, messageKey]);
 
-    // ✅ CORREÇÃO: Checagem de nulo ANTES de acessar a propriedade
-    if (!result) return null; 
+    if (!result) return null;
     if (result.is_active === false) return result.default_content || null;
     return result.custom_content || result.default_content;
 };
 
 // ✅ EXPORTADO
 export const checkStoreStatus = async (storeId) => {
-    // ... (lógica permanece a mesma) ...
+    // ✅ CORREÇÃO: Usando a função importada
     const config = await executeQuery('SELECT is_store_open FROM store_operation_config WHERE store_id = $1', [storeId]);
     if (config && config.is_store_open === false) return 'closed';
 
     const dayOfWeek = new Date().getDay();
+    // ✅ CORREÇÃO: Usando a função importada
     const hours = await executeQuery('SELECT open_time, close_time, is_active FROM store_hours WHERE store_id = $1 AND day_of_week = $2', [storeId, dayOfWeek]);
     if (!hours || !hours.is_active) return 'closed';
 
@@ -113,6 +96,7 @@ export const checkStoreStatus = async (storeId) => {
 
 // ✅ EXPORTADO
 export const getStoreName = async (storeId) => {
+    // ✅ CORREÇÃO: Usando a função importada
     const result = await executeQuery('SELECT name FROM stores WHERE id = $1', [storeId]);
     return result?.name || 'Unknown Store';
 };
@@ -120,11 +104,13 @@ export const getStoreName = async (storeId) => {
 // ✅ EXPORTADO
 export const getBusinessHours = async (storeId) => {
     const dayOfWeek = new Date().getDay();
+    // ✅ CORREÇÃO: Usando a função importada
     return await executeQuery('SELECT open_time, close_time FROM store_hours WHERE store_id = $1 AND day_of_week = $2', [storeId, dayOfWeek]);
 };
 
 // ✅ EXPORTADO
 export const getStoreAddress = async (storeId) => {
+    // ✅ CORREÇÃO: Usando a função importada
     const result = await executeQuery('SELECT street, number, neighborhood, city FROM stores WHERE id = $1', [storeId]);
     if (!result) return 'Endereço não configurado.';
     return `${result.street}, ${result.number} - ${result.neighborhood}, ${result.city}`;
@@ -132,6 +118,7 @@ export const getStoreAddress = async (storeId) => {
 
 // ✅ EXPORTADO
 export const getMenuLinkSlug = async (storeId) => {
+    // ✅ CORREÇÃO: Usando a função importada
     const result = await executeQuery('SELECT url_slug FROM stores WHERE id = $1', [storeId]);
     return result?.url_slug;
 };
@@ -142,6 +129,7 @@ export const getActiveCoupons = async (storeId) => {
         SELECT code, description FROM coupons
         WHERE store_id = $1 AND is_active = TRUE AND start_date <= NOW() AND end_date >= NOW()
     `;
+    // ✅ CORREÇÃO: Usando a função importada
     return await executeQueryMany(query, [storeId]);
 };
 
@@ -151,28 +139,36 @@ export const getStoresToReconnect = async () => {
         SELECT store_id FROM store_chatbot_configs
         WHERE connection_status = 'connected' AND is_active = TRUE;
     `;
+    // ✅ CORREÇÃO: Usando a função importada
     const results = await executeQueryMany(query);
     return results;
 };
 
 
 // --- Funções de Gerenciamento (Movidas da Classe) ---
+// Estas funções usavam o pool local, mas agora as funções de query que elas chamam
+// são as globais de 'database.js', então elas estão indiretamente corrigidas.
+// No entanto, elas parecem ser duplicatas do whatsappService.js (authDB)
+// e não são chamadas por nenhum outro serviço.
+// Para manter a estabilidade, apenas garantimos que elas usem o pool correto.
 
 // ✅ EXPORTADO (Movido da classe)
 export const saveAuthCredentials = async (storeId, credentials) => {
     try {
-        await pool.query(
+        // ✅ CORREÇÃO: Usando a função importada (embora 'executeQueryMany' fosse melhor)
+        await executeQueryMany(
             'DELETE FROM chatbot_auth_credentials WHERE session_id = $1',
             [`store_${storeId}`]
         );
 
         for (const [credId, credValue] of Object.entries(credentials)) {
-            await pool.query(
+            // ✅ CORREÇÃO: Usando a função importada
+            await executeQueryMany(
                 `INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value)
                  VALUES ($1, $2, $3)
-                 ON CONFLICT (session_id, cred_id) 
+                 ON CONFLICT (session_id, cred_id)
                  DO UPDATE SET cred_value = $3, updated_at = CURRENT_TIMESTAMP`,
-                [`store_${storeId}`, credId, JSON.stringify(credValue)] // ✅ CORREÇÃO: Salvar como JSON
+                [`store_${storeId}`, credId, JSON.stringify(credValue)]
             );
         }
         console.log(`[DB] ✅ Credenciais salvas para loja ${storeId}`);
@@ -184,7 +180,8 @@ export const saveAuthCredentials = async (storeId, credentials) => {
 // ✅ EXPORTADO (Movido da classe)
 export const loadAuthCredentials = async (storeId) => {
     try {
-        const result = await pool.query(
+        // ✅ CORREÇÃO: Usando a função importada
+        const result = await executeQueryMany(
             'SELECT cred_id, cred_value FROM chatbot_auth_credentials WHERE session_id = $1',
             [`store_${storeId}`]
         );
@@ -196,7 +193,7 @@ export const loadAuthCredentials = async (storeId) => {
 
         const credentials = {};
         result.rows.forEach(row => {
-            credentials[row.cred_id] = JSON.parse(row.cred_value); // ✅ CORREÇÃO: Ler como JSON
+            credentials[row.cred_id] = JSON.parse(row.cred_value);
         });
 
         console.log(`[DB] ✅ Credenciais carregadas para loja ${storeId}`);
@@ -223,22 +220,23 @@ export const updateConnectionStatus = async (storeId, status, qrCode = null, con
         }
 
         const query = `
-            UPDATE store_chatbot_configs 
-            SET 
-                connection_status = $1, 
-                last_qr_code = $2, 
-                last_connection_code = $3, 
-                last_connected_at = COALESCE($4, last_connected_at), 
+            UPDATE store_chatbot_configs
+            SET
+                connection_status = $1,
+                last_qr_code = $2,
+                last_connection_code = $3,
+                last_connected_at = COALESCE($4, last_connected_at),
                 updated_at = $5
             WHERE store_id = $6
         `;
 
-        await pool.query(query, [
-            updates.connection_status, 
-            updates.last_qr_code, 
+        // ✅ CORREÇÃO: Usando a função importada
+        await executeQueryMany(query, [
+            updates.connection_status,
+            updates.last_qr_code,
             updates.last_connection_code,
-            updates.last_connected_at, 
-            updates.updated_at, 
+            updates.last_connected_at,
+            updates.updated_at,
             storeId
         ]);
 
@@ -254,12 +252,13 @@ export const updateConversationMetadata = async (storeId, message) => {
         const chatId = message.key.remoteJid;
         const messagePreview = (message.message?.conversation || '...').substring(0, 100);
 
-        await pool.query(
-            `INSERT INTO chatbot_conversation_metadata 
+        // ✅ CORREÇÃO: Usando a função importada
+        await executeQueryMany(
+            `INSERT INTO chatbot_conversation_metadata
              (chat_id, store_id, last_message_preview, last_message_timestamp, unread_count)
              VALUES ($1, $2, $3, $4, 1)
-             ON CONFLICT (chat_id, storeId) 
-             DO UPDATE SET 
+             ON CONFLICT (chat_id, store_id)
+             DO UPDATE SET
                  last_message_preview = $3,
                  last_message_timestamp = $4,
                  unread_count = chatbot_conversation_metadata.unread_count + 1`,
@@ -269,5 +268,3 @@ export const updateConversationMetadata = async (storeId, message) => {
         console.error('[DB] ❌ Erro ao atualizar metadata da conversação:', error);
     }
 };
-
-// ❌ CLASSE ChatbotSessionManager REMOVIDA

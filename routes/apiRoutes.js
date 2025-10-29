@@ -1,46 +1,22 @@
-// routes/apiRoutes.js - VERSÃO SEGURA COM RATE LIMITING AVANÇADO
+// routes/apiRoutes.js - VERSÃO SEGURA COM CENTRALIZAÇÃO DE AUTH
 
 import express from 'express';
-import crypto from 'crypto'; // ✅ CORREÇÃO: Import adicionado
+// ❌ crypto não é mais necessário aqui
 import rateLimit from 'express-rate-limit';
 import whatsappService from '../services/whatsappService.js';
 import { body, param, validationResult } from 'express-validator';
+// ✅ CORREÇÃO: Importar o middleware de segurança centralizado
+import { verifyWebhookSecret } from '../middleware/security.js';
 
 const router = express.Router();
-const { CHATBOT_WEBHOOK_SECRET } = process.env;
+// ❌ A variável CHATBOT_WEBHOOK_SECRET não é mais necessária aqui
+// const { CHATBOT_WEBHOOK_SECRET } = process.env;
 
-// ✅ SEGURANÇA: Validação de secret com timing-safe comparison
-const verifySecret = (req, res, next) => {
-    const receivedSecret = req.headers['x-webhook-secret'];
-
-    if (!receivedSecret || !CHATBOT_WEBHOOK_SECRET) {
-        return res.status(403).json({ error: 'Unauthorized access' });
-    }
-
-    try {
-        // ✅ Timing-safe comparison para prevenir timing attacks
-        const receivedBuffer = Buffer.from(receivedSecret);
-        const expectedBuffer = Buffer.from(CHATBOT_WEBHOOK_SECRET);
-
-        if (receivedBuffer.length !== expectedBuffer.length) {
-            return res.status(403).json({ error: 'Unauthorized access' });
-        }
-
-        const isValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
-
-        if (!isValid) {
-            return res.status(403).json({ error: 'Unauthorized access' });
-        }
-
-        next();
-    } catch (error) {
-        console.error('[AUTH] Secret verification error:', error.message);
-        return res.status(403).json({ error: 'Unauthorized access' });
-    }
-};
+// ❌ REMOVIDO: Função 'verifySecret' local duplicada.
+// Estamos importando 'verifyWebhookSecret' do 'security.js'
 
 
-// ✅ SEGURANÇA: Rate limiter por loja
+// ✅ SEGURANÇA: Rate limiter por loja (Lógica mantida, pois é especializada)
 const createStoreLimiter = (max, windowMs) => rateLimit({
     windowMs,
     max,
@@ -60,12 +36,12 @@ const createStoreLimiter = (max, windowMs) => rateLimit({
     skip: (req) => req.ip === '127.0.0.1' // Skip localhost em dev
 });
 
-// ✅ Rate limiters específicos por endpoint
+// ✅ Rate limiters específicos por endpoint (Mantidos)
 const connectionLimiter = createStoreLimiter(10, 15 * 60 * 1000); // 10 conexões a cada 15min
 const messageLimiter = createStoreLimiter(100, 60 * 1000); // 100 mensagens por minuto
 const statusLimiter = createStoreLimiter(60, 60 * 1000); // 60 updates por minuto
 
-// ✅ Middleware de validação de erros
+// ✅ Middleware de validação de erros (Mantido)
 const validateRequest = (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -78,7 +54,8 @@ const validateRequest = (req, res, next) => {
 };
 
 // ✅ Aplicar security middleware
-router.use(verifySecret);
+// ✅ CORREÇÃO: Usando a função importada
+router.use(verifyWebhookSecret);
 
 // ✅ ENDPOINT: Iniciar sessão com validação completa
 router.post('/start-session',
@@ -124,6 +101,9 @@ router.post('/start-session',
         }
     }
 );
+
+// ... (O restante do arquivo 'apiRoutes.js' permanece exatamente o mesmo) ...
+// (disconnect, send-message, update-status, pause-chat, profile-picture, contact-name, health)
 
 // ✅ ENDPOINT: Desconectar sessão
 router.post('/disconnect',
