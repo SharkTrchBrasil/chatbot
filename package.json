@@ -1,29 +1,48 @@
 {
   "name": "whatsapp-chatbot-app",
-  "version": "1.0.0",
-  "description": "WhatsApp Chatbot Service",
+  "version": "2.0.0",
+  "description": "WhatsApp Chatbot Service - Production Ready",
   "main": "app.js",
   "type": "module",
   "scripts": {
     "start": "node app.js",
-    "start:dev": "node --watch app.js"
+    "start:dev": "NODE_ENV=development node --watch app.js",
+    "start:prod": "NODE_ENV=production node app.js",
+    "start:gc": "node --expose-gc app.js",
+    "test": "node --test",
+    "lint": "eslint .",
+    "format": "prettier --write ."
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=20.x"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "7.0.0-rc.6",
     "axios": "^1.7.2",
+    "compression": "^1.7.4",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.3.1",
+    "express-validator": "^7.0.1",
     "form-data": "^4.0.0",
-    "fs-extra": "^11.2.0",
     "helmet": "^7.1.0",
     "node-cache": "^5.1.2",
     "pg": "^8.12.0",
     "pino": "^9.2.0",
     "qrcode-terminal": "^0.12.0"
-  }
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5"
+  },
+  "keywords": [
+    "whatsapp",
+    "chatbot",
+    "baileys",
+    "automation",
+    "messaging"
+  ],
+  "author": "PDVix Platform",
+  "license": "MIT"
 }

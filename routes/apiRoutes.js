@@ -1,173 +1,362 @@
-// routes/apiRoutes.js
+// routes/apiRoutes.js - VERSÃO SEGURA COM RATE LIMITING AVANÇADO
 
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import whatsappService from '../services/whatsappService.js';
+import { body, param, validationResult } from 'express-validator';
 
 const router = express.Router();
 const { CHATBOT_WEBHOOK_SECRET } = process.env;
 
-// Security verification middleware
+// ✅ SEGURANÇA: Validação de secret com timing-safe comparison
 const verifySecret = (req, res, next) => {
     const receivedSecret = req.headers['x-webhook-secret'];
-    if (receivedSecret && receivedSecret === CHATBOT_WEBHOOK_SECRET) {
-        return next();
+
+    if (!receivedSecret || !CHATBOT_WEBHOOK_SECRET) {
+        return res.status(403).json({ error: 'Unauthorized access' });
     }
-    res.status(403).json({ error: 'Unauthorized access. Invalid secret key.' });
+
+    // ✅ Timing-safe comparison para prevenir timing attacks
+    const receivedBuffer = Buffer.from(receivedSecret);
+    const expectedBuffer = Buffer.from(CHATBOT_WEBHOOK_SECRET);
+
+    if (receivedBuffer.length !== expectedBuffer.length) {
+        return res.status(403).json({ error: 'Unauthorized access' });
+    }
+
+    const isValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
+
+    if (!isValid) {
+        return res.status(403).json({ error: 'Unauthorized access' });
+    }
+
+    next();
 };
 
-// Applying the middleware to all routes in this file
+// ✅ SEGURANÇA: Rate limiter por loja
+const createStoreLimiter = (max, windowMs) => rateLimit({
+    windowMs,
+    max,
+    keyGenerator: (req) => {
+        // Rate limit baseado em storeId + IP
+        const storeId = req.body.storeId || req.params.storeId || 'unknown';
+        return `${req.ip}-store-${storeId}`;
+    },
+    handler: (req, res) => {
+        res.status(429).json({
+            error: 'Too many requests. Please try again later.',
+            retryAfter: Math.ceil(windowMs / 1000)
+        });
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.ip === '127.0.0.1' // Skip localhost em dev
+});
+
+// ✅ Rate limiters específicos por endpoint
+const connectionLimiter = createStoreLimiter(10, 15 * 60 * 1000); // 10 conexões a cada 15min
+const messageLimiter = createStoreLimiter(100, 60 * 1000); // 100 mensagens por minuto
+const statusLimiter = createStoreLimiter(60, 60 * 1000); // 60 updates por minuto
+
+// ✅ Middleware de validação de erros
+const validateRequest = (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            error: 'Validation failed',
+            details: errors.array()
+        });
+    }
+    next();
+};
+
+// ✅ Aplicar security middleware
 router.use(verifySecret);
 
+// ✅ ENDPOINT: Iniciar sessão com validação completa
+router.post('/start-session',
+    connectionLimiter,
+    [
+        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
+        body('method').isIn(['qr', 'pairing']).withMessage('method must be "qr" or "pairing"'),
+        body('phoneNumber').optional().matches(/^\d{10,15}$/).withMessage('phoneNumber must be 10-15 digits')
+    ],
+    validateRequest,
+    async (req, res) => {
+        const { storeId, phoneNumber, method } = req.body;
 
-router.post('/start-session', (req, res) => {
-    // ✅ 1. Extrai os três parâmetros do corpo da requisição.
-    const { storeId, phoneNumber, method } = req.body;
-
-    // ✅ 2. Validação: phoneNumber agora só é obrigatório se o método for 'pairing'.
-    if (!storeId || !method) {
-        return res.status(400).json({ error: 'storeId and method ("qr" or "pairing") are required.' });
-    }
-    if (method === 'pairing' && !phoneNumber) {
-        return res.status(400).json({ error: 'phoneNumber is required for pairing method.' });
-    }
-    if (method !== 'qr' && method !== 'pairing') {
-        return res.status(400).json({ error: 'method must be either "qr" or "pairing".' });
-    }
-
-    const session = whatsappService.activeSessions.get(String(storeId));
-    if (session && ['connecting', 'open', 'closing'].includes(session.status)) {
-        return res.status(200).json({ message: `Session is already ${session.status}.` });
-    }
-
-    // ✅ 3. Passa TODOS os parâmetros para a função de serviço.
-    whatsappService.startSession(storeId, phoneNumber, method);
-    res.status(202).json({ message: 'Connection process initiated.' });
-});
-
-router.post('/disconnect', async (req, res) => {
-    const { storeId } = req.body;
-    if (!storeId) return res.status(400).json({ error: 'storeId is required.' });
-
-    console.log(`[STORE ${storeId}] Received disconnection request.`);
-    // ✅ CORRIGIDO: Passando o storeId para a função de serviço
-    await whatsappService.disconnectSession(storeId);
-    res.status(200).json({ message: 'Disconnection process completed and session removed.' });
-});
-
-
-
-router.post('/send-message', async (req, res) => {
-    // 1. ✅ Extrai TODOS os campos do corpo da requisição
-    const { storeId, number, message, mediaUrl, mediaType, mediaFilename } = req.body;
-
-    // 2. ✅ Validação ajustada: permite mensagem vazia se houver mídia
-    if (!storeId || !number) {
-        return res.status(400).json({ error: 'storeId and number are required.' });
-    }
-    if (!message && !mediaUrl) {
-        return res.status(400).json({ error: 'Either message or mediaUrl is required.' });
-    }
-
-
-    try {
-        // 3. ✅ Passa TODOS os parâmetros para a função de serviço
-        const success = await whatsappService.sendMessage(
-            storeId,
-            number,
-            message || '', // Garante que message seja sempre uma string
-            mediaUrl,
-            mediaType,
-            mediaFilename
-        );
-
-        if (success) {
-            res.status(200).json({ success: true, message: 'Message sent successfully.' });
-        } else {
-            // Este erro agora faz mais sentido, pois pode falhar se a sessão não estiver ativa
-            res.status(409).json({ error: 'Chatbot is not connected for this store.' });
+        // ✅ Validação condicional
+        if (method === 'pairing' && !phoneNumber) {
+            return res.status(400).json({
+                error: 'phoneNumber is required for pairing method'
+            });
         }
-    } catch (e) {
-        console.error(`[STORE ${storeId}] Failed to send message to ${number}:`, e);
-        res.status(500).json({ error: 'Failed to send message via WhatsApp.' });
-    }
-});
 
+        const session = whatsappService.activeSessions.get(String(storeId));
 
-router.post('/update-status', (req, res) => {
-    const { storeId, isActive } = req.body;
-    if (!storeId || typeof isActive !== 'boolean') {
-        return res.status(400).json({ error: 'storeId and isActive (boolean) fields are required.' });
-    }
-
-    const session = whatsappService.activeSessions.get(String(storeId));
-    if (session && session.status === 'open') {
-        session.isActive = isActive;
-        whatsappService.activeSessions.set(String(storeId), session);
-        console.log(`[STORE ${storeId}] Activity status changed to: ${isActive}`);
-        res.status(200).json({ message: 'Status updated successfully.' });
-    } else {
-        res.status(404).json({ error: 'Session not found or not connected.' });
-    }
-});
-
-
-router.post('/pause-chat', (req, res) => {
-    const { storeId, chatId } = req.body;
-    if (!storeId || !chatId) {
-        return res.status(400).json({ error: 'storeId and chatId are required.' });
-    }
-
-    try {
-        const success = whatsappService.pauseChatForHuman(storeId, chatId);
-        if (success) {
-            res.status(200).json({ message: 'Chat paused for human support successfully.' });
-        } else {
-            res.status(404).json({ error: 'Active session or conversation state not found.' });
+        if (session && ['connecting', 'open'].includes(session.status)) {
+            return res.status(200).json({
+                message: `Session is already ${session.status}`,
+                status: session.status
+            });
         }
-    } catch (e) {
-        console.error(`[STORE ${storeId}] Failed to pause chat for ${chatId}:`, e);
-        res.status(500).json({ error: 'Failed to process pause request.' });
-    }
-});
 
-// Endpoint para buscar a foto de perfil
-router.get('/profile-picture/:storeId/:chatId', async (req, res) => {
-    const { storeId, chatId } = req.params;
-    if (!storeId || !chatId) {
-        return res.status(400).json({ error: 'storeId and chatId are required.' });
-    }
-    try {
-        const url = await whatsappService.getProfilePictureUrl(storeId, chatId);
-        if (url) {
-            res.status(200).json({ profilePicUrl: url });
-        } else {
-            res.status(404).json({ error: 'Profile picture not found.' });
+        try {
+            await whatsappService.startSession(storeId, phoneNumber, method);
+            res.status(202).json({
+                message: 'Connection process initiated',
+                storeId,
+                method
+            });
+        } catch (error) {
+            console.error(`[API] Failed to start session for store ${storeId}:`, error.message);
+            res.status(500).json({
+                error: 'Failed to initiate connection',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
         }
-    } catch (e) {
-        res.status(500).json({ error: 'Internal server error.' });
     }
-});
+);
 
-// Endpoint para buscar o nome do contato
-router.get('/contact-name/:storeId/:chatId', async (req, res) => {
-    const { storeId, chatId } = req.params;
-    if (!storeId || !chatId) {
-        return res.status(400).json({ error: 'storeId and chatId are required.' });
-    }
-    try {
-        const name = await whatsappService.getContactName(storeId, chatId);
-        if (name) {
-            res.status(200).json({ name: name });
-        } else {
-            res.status(404).json({ error: 'Contact name not found.' });
+// ✅ ENDPOINT: Desconectar sessão
+router.post('/disconnect',
+    connectionLimiter,
+    [
+        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer')
+    ],
+    validateRequest,
+    async (req, res) => {
+        const { storeId } = req.body;
+
+        try {
+            console.log(`[API] Disconnecting store ${storeId}`);
+            await whatsappService.disconnectSession(storeId);
+
+            res.status(200).json({
+                message: 'Disconnection completed',
+                storeId
+            });
+        } catch (error) {
+            console.error(`[API] Failed to disconnect store ${storeId}:`, error.message);
+            res.status(500).json({
+                error: 'Failed to disconnect',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
         }
-    } catch (e) {
-        res.status(500).json({ error: 'Internal server error.' });
     }
+);
+
+// ✅ ENDPOINT: Enviar mensagem com validação
+router.post('/send-message',
+    messageLimiter,
+    [
+        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
+        body('number').matches(/^\d{10,15}$/).withMessage('number must be 10-15 digits'),
+        body('message').optional().isString().isLength({ max: 4096 }).withMessage('message too long'),
+        body('mediaUrl').optional().isURL().withMessage('mediaUrl must be a valid URL'),
+        body('mediaType').optional().isIn(['image', 'audio', 'document']).withMessage('Invalid mediaType'),
+        body('mediaFilename').optional().isString().isLength({ max: 255 })
+    ],
+    validateRequest,
+    async (req, res) => {
+        const { storeId, number, message, mediaUrl, mediaType, mediaFilename } = req.body;
+
+        // ✅ Validação: mensagem OU mídia obrigatória
+        if (!message && !mediaUrl) {
+            return res.status(400).json({
+                error: 'Either message or mediaUrl is required'
+            });
+        }
+
+        try {
+            const success = await whatsappService.sendMessage(
+                storeId,
+                number,
+                message || '',
+                mediaUrl,
+                mediaType,
+                mediaFilename
+            );
+
+            if (success) {
+                res.status(200).json({
+                    success: true,
+                    message: 'Message sent successfully',
+                    storeId,
+                    recipient: number
+                });
+            } else {
+                res.status(409).json({
+                    error: 'Session not ready or message failed',
+                    storeId
+                });
+            }
+        } catch (error) {
+            console.error(`[API] Failed to send message for store ${storeId}:`, error.message);
+            res.status(500).json({
+                error: 'Failed to send message',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+    }
+);
+
+// ✅ ENDPOINT: Atualizar status de atividade
+router.post('/update-status',
+    statusLimiter,
+    [
+        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
+        body('isActive').isBoolean().withMessage('isActive must be boolean')
+    ],
+    validateRequest,
+    (req, res) => {
+        const { storeId, isActive } = req.body;
+
+        const session = whatsappService.activeSessions.get(String(storeId));
+
+        if (session && session.status === 'open') {
+            session.isActive = isActive;
+            whatsappService.activeSessions.set(String(storeId), session);
+
+            console.log(`[API] Store ${storeId} activity status: ${isActive}`);
+
+            res.status(200).json({
+                message: 'Status updated successfully',
+                storeId,
+                isActive
+            });
+        } else {
+            res.status(404).json({
+                error: 'Session not found or not connected',
+                storeId
+            });
+        }
+    }
+);
+
+// ✅ ENDPOINT: Pausar chat para atendimento humano
+router.post('/pause-chat',
+    statusLimiter,
+    [
+        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
+        body('chatId').matches(/^\d+@s\.whatsapp\.net$/).withMessage('Invalid chatId format')
+    ],
+    validateRequest,
+    (req, res) => {
+        const { storeId, chatId } = req.body;
+
+        try {
+            const success = whatsappService.pauseChatForHuman(storeId, chatId);
+
+            if (success) {
+                res.status(200).json({
+                    message: 'Chat paused for human support',
+                    storeId,
+                    chatId,
+                    pauseDuration: '30 minutes'
+                });
+            } else {
+                res.status(404).json({
+                    error: 'Session not found or not ready',
+                    storeId
+                });
+            }
+        } catch (error) {
+            console.error(`[API] Failed to pause chat for store ${storeId}:`, error.message);
+            res.status(500).json({
+                error: 'Failed to pause chat',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+    }
+);
+
+// ✅ ENDPOINT: Buscar foto de perfil
+router.get('/profile-picture/:storeId/:chatId',
+    statusLimiter,
+    [
+        param('storeId').isInt({ min: 1 }),
+        param('chatId').matches(/^\d+@s\.whatsapp\.net$/)
+    ],
+    validateRequest,
+    async (req, res) => {
+        const { storeId, chatId } = req.params;
+
+        try {
+            const url = await whatsappService.getProfilePictureUrl(storeId, chatId);
+
+            if (url) {
+                res.status(200).json({
+                    profilePicUrl: url,
+                    chatId
+                });
+            } else {
+                res.status(404).json({
+                    error: 'Profile picture not found',
+                    chatId
+                });
+            }
+        } catch (error) {
+            console.error(`[API] Failed to fetch profile picture:`, error.message);
+            res.status(500).json({
+                error: 'Failed to fetch profile picture',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+    }
+);
+
+// ✅ ENDPOINT: Buscar nome do contato
+router.get('/contact-name/:storeId/:chatId',
+    statusLimiter,
+    [
+        param('storeId').isInt({ min: 1 }),
+        param('chatId').matches(/^\d+@s\.whatsapp\.net$/)
+    ],
+    validateRequest,
+    async (req, res) => {
+        const { storeId, chatId } = req.params;
+
+        try {
+            const name = await whatsappService.getContactName(storeId, chatId);
+
+            if (name) {
+                res.status(200).json({
+                    name,
+                    chatId
+                });
+            } else {
+                res.status(404).json({
+                    error: 'Contact name not found',
+                    chatId
+                });
+            }
+        } catch (error) {
+            console.error(`[API] Failed to fetch contact name:`, error.message);
+            res.status(500).json({
+                error: 'Failed to fetch contact name',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+    }
+);
+
+// ✅ ENDPOINT: Health check (sem autenticação)
+router.get('/health', (req, res) => {
+    const activeSessions = whatsappService.activeSessions.size;
+    const openSessions = Array.from(whatsappService.activeSessions.values())
+        .filter(s => s.status === 'open').length;
+
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        sessions: {
+            total: activeSessions,
+            connected: openSessions
+        },
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+    });
 });
-
-
-
-
 
 export default router;
