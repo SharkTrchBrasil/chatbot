@@ -1,9 +1,7 @@
-// app.js - VERSÃO À PROVA DE BALAS COM TODAS AS OTIMIZAÇÕES
+// app.js - VERSÃO ROBUSTA E SEGURA
 
-import 'dotenv/config';
 import express from 'express';
-import helmet from 'helmet';
-import compression from 'compression';
+import dotenv from 'dotenv';
 import whatsappService from './services/whatsappService.js';
 import apiRoutes from './routes/apiRoutes.js';
 import platformApiRoutes from './routes/platformApiRoutes.js';
@@ -11,106 +9,67 @@ import { closePool } from './config/database.js';
 import {
     requestLogger,
     errorHandler,
-    getDetailedHealth,
     startResourceMonitoring
 } from './middleware/monitoring.js';
+import { startDLQProcessor } from './utils/forwarder.js';
 
-// ✅ SEGURANÇA: Validação de variáveis de ambiente obrigatórias
-const requiredEnvVars = ['FASTAPI_URL', 'CHATBOT_WEBHOOK_SECRET', 'DATABASE_URL'];
-const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+dotenv.config();
 
-if (missingVars.length > 0) {
-    console.error(`❌ CRITICAL ERROR: Missing required environment variables: ${missingVars.join(', ')}`);
-    process.exit(1);
-}
-
-const { PORT = 3000, NODE_ENV = 'production' } = process.env;
 const app = express();
+const PORT = process.env.PORT || 8080;
+const MAX_STARTUP_ATTEMPTS = 3;
+const STARTUP_DELAY = 5000;
 
-// ✅ PERFORMANCE: Compression middleware
-app.use(compression({
-    filter: (req, res) => {
-        if (req.headers['x-no-compression']) {
-            return false;
-        }
-        return compression.filter(req, res);
-    },
-    level: 6 // Balanceamento entre CPU e tamanho
-}));
+// ✅ Estado da aplicação
+let isShuttingDown = false;
+let isStartupComplete = false;
+let server = null;
 
-// ✅ SEGURANÇA: Helmet com configurações seguras
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-            scriptSrc: ["'self'"],
-            imgSrc: ["'self'", 'data:', 'https:'],
-        },
-    },
-    hsts: {
-        maxAge: 31536000,
-        includeSubDomains: true,
-        preload: true
-    }
-}));
+// ============================================================
+// MIDDLEWARES
+// ============================================================
 
-// ✅ PERFORMANCE: Limitar tamanho do body
-app.use(express.json({
-    limit: '10mb',
-    strict: true
-}));
-app.use(express.urlencoded({
-    extended: true,
-    limit: '10mb'
-}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ✅ OBSERVABILIDADE: Request logging
+// ✅ Middleware de logging
 app.use(requestLogger);
 
-// ✅ Health check público (sem autenticação)
-app.get('/', (req, res) => {
-    res.status(200).json({
-        status: 'ok',
-        service: 'WhatsApp Chatbot Service',
-        version: '2.0.0',
-        timestamp: new Date().toISOString()
-    });
+// ✅ SEGURANÇA: Headers de segurança
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
 });
 
-// ✅ Health check detalhado
-app.get('/health', async (req, res) => {
-    try {
-        const health = await getDetailedHealth();
-        const statusCode = health.status === 'healthy' ? 200 : 503;
-        res.status(statusCode).json(health);
-    } catch (error) {
-        res.status(503).json({
-            status: 'unhealthy',
-            error: error.message,
-            timestamp: new Date().toISOString()
-        });
-    }
+// ✅ Health check endpoint (sem autenticação)
+app.get('/health', (req, res) => {
+    const healthStatus = {
+        status: isStartupComplete ? 'healthy' : 'starting',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        sessions: {
+            total: whatsappService.activeSessions.size,
+            connected: Array.from(whatsappService.activeSessions.values())
+                .filter(s => s.status === 'open').length
+        },
+        memory: {
+            used: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+            total: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`
+        }
+    };
+
+    const statusCode = isStartupComplete ? 200 : 503;
+    res.status(statusCode).json(healthStatus);
 });
 
-// ✅ Metrics endpoint (proteger em produção)
-app.get('/metrics', (req, res) => {
-    if (NODE_ENV === 'production' && req.headers['x-metrics-token'] !== process.env.METRICS_TOKEN) {
-        return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    getDetailedHealth().then(health => {
-        res.status(200).json(health);
-    }).catch(error => {
-        res.status(500).json({ error: error.message });
-    });
-});
-
-// ✅ Rotas da API com prefixos
+// ✅ Rotas da API
 app.use('/api', apiRoutes);
-app.use('/platform-api', platformApiRoutes);
+app.use('/api', platformApiRoutes);
 
-// ✅ 404 Handler
+// ✅ Rota 404
 app.use((req, res) => {
     res.status(404).json({
         error: 'Endpoint not found',
@@ -119,104 +78,160 @@ app.use((req, res) => {
     });
 });
 
-// ✅ SEGURANÇA: Global error handler
+// ✅ Error handler global
 app.use(errorHandler);
 
-// ✅ ROBUSTEZ: Startup com retry
-const startServer = async (retries = 3) => {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            console.log(`\n${'='.repeat(60)}`);
-            console.log(`🚀 Starting WhatsApp Chatbot Service (Attempt ${attempt}/${retries})`);
-            console.log(`${'='.repeat(60)}\n`);
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
 
-            // ✅ Iniciar monitoramento de recursos
-            startResourceMonitoring();
-            console.log('✅ Resource monitoring started');
+const gracefulShutdown = async (signal) => {
+    if (isShuttingDown) {
+        console.log('[SHUTDOWN] Already shutting down. Ignoring duplicate signal.');
+        return;
+    }
 
-            // ✅ Restaurar sessões ativas
-            console.log('🔄 Restoring active sessions...');
-            await whatsappService.restoreActiveSessions();
-            console.log('✅ Session restore completed');
+    isShuttingDown = true;
+    console.log(`\n[SHUTDOWN] 🛑 ${signal} received. Starting graceful shutdown...`);
 
-            // ✅ Iniciar servidor HTTP
-            const server = app.listen(PORT, () => {
-                console.log(`\n${'='.repeat(60)}`);
-                console.log(`✅ Server running on port ${PORT}`);
-                console.log(`📊 Environment: ${NODE_ENV}`);
-                console.log(`🕐 Started at: ${new Date().toISOString()}`);
-                console.log(`${'='.repeat(60)}\n`);
-            });
+    // ✅ CORREÇÃO: Aguardar startup completar antes de desligar
+    if (!isStartupComplete) {
+        console.log('[SHUTDOWN] ⏳ Waiting for startup to complete (max 10s)...');
+        let waited = 0;
+        while (!isStartupComplete && waited < 10000) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            waited += 500;
+        }
+    }
 
-            // ✅ ROBUSTEZ: Configurar timeouts do servidor
-            server.keepAliveTimeout = 65000; // Maior que ALB timeout (60s)
-            server.headersTimeout = 66000;
-
-            // ✅ ROBUSTEZ: Graceful shutdown handlers
-            const gracefulShutdown = async (signal) => {
-                console.log(`\n⚠️  ${signal} received. Starting graceful shutdown...`);
-
-                server.close(async () => {
-                    console.log('✅ HTTP server closed');
-
-                    try {
-                        await whatsappService.shutdown();
-                        console.log('✅ WhatsApp sessions closed');
-
-                        await closePool();
-                        console.log('✅ Database connections closed');
-
-                        console.log('✅ Graceful shutdown completed');
-                        process.exit(0);
-                    } catch (error) {
-                        console.error('❌ Error during shutdown:', error);
-                        process.exit(1);
-                    }
+    try {
+        // ✅ Passo 1: Parar de aceitar novas requisições
+        if (server) {
+            console.log('[SHUTDOWN] 📴 Closing HTTP server...');
+            await new Promise((resolve, reject) => {
+                server.close((err) => {
+                    if (err) reject(err);
+                    else resolve();
                 });
-
-                // ✅ Forçar saída após 30s se não completar
-                setTimeout(() => {
-                    console.error('❌ Forced shutdown after timeout');
-                    process.exit(1);
-                }, 30000);
-            };
-
-            process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-            process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-            // ✅ ROBUSTEZ: Handlers para erros não capturados
-            process.on('uncaughtException', (error) => {
-                console.error('❌ UNCAUGHT EXCEPTION:', error);
-                gracefulShutdown('UNCAUGHT_EXCEPTION');
             });
+            console.log('[SHUTDOWN] ✅ HTTP server closed');
+        }
 
-            process.on('unhandledRejection', (reason, promise) => {
-                console.error('❌ UNHANDLED REJECTION at:', promise, 'reason:', reason);
-                // Não fazer shutdown para rejeições não tratadas em desenvolvimento
-                if (NODE_ENV === 'production') {
-                    gracefulShutdown('UNHANDLED_REJECTION');
-                }
-            });
+        // ✅ Passo 2: Fechar conexões WhatsApp
+        console.log('[SHUTDOWN] 📱 Closing WhatsApp sessions...');
+        await whatsappService.shutdown();
+        console.log('[SHUTDOWN] ✅ WhatsApp sessions closed');
 
-            return; // Sucesso, sair do loop
+        // ✅ Passo 3: Fechar pool de banco de dados
+        console.log('[SHUTDOWN] 🗄️ Closing database connections...');
+        await closePool();
+        console.log('[SHUTDOWN] ✅ Database connections closed');
 
-        } catch (error) {
-            console.error(`❌ Startup failed (attempt ${attempt}/${retries}):`, error.message);
+        console.log('[SHUTDOWN] ✅ Graceful shutdown completed successfully');
+        process.exit(0);
+    } catch (error) {
+        console.error('[SHUTDOWN] ❌ Error during shutdown:', error);
+        process.exit(1);
+    }
+};
 
-            if (attempt < retries) {
-                const delay = attempt * 5000; // Exponential backoff
-                console.log(`⏳ Retrying in ${delay/1000}s...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            } else {
-                console.error('❌ Max startup retries reached. Exiting.');
-                process.exit(1);
-            }
+// ✅ Event handlers para shutdown
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ✅ CRÍTICO: Handler para uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('\n============================================================');
+    console.error('❌ UNCAUGHT EXCEPTION:', error.name, error.message);
+    console.error('============================================================');
+    console.error('Stack Trace:', error.stack);
+    console.error('============================================================');
+    console.error('⚠️  UNCAUGHT_EXCEPTION received. Starting graceful shutdown...');
+
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+// ✅ Handler para unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('\n============================================================');
+    console.error('❌ UNHANDLED REJECTION at:', promise);
+    console.error('Reason:', reason);
+    console.error('============================================================');
+
+    // ✅ Não fazer shutdown em rejections, apenas logar
+    // Alguns são esperados (ex: timeout de conexão)
+});
+
+// ============================================================
+// STARTUP COM RETRY
+// ============================================================
+
+const startServer = async (attempt = 1) => {
+    console.log('\n============================================================');
+    console.log(`🚀 Starting WhatsApp Chatbot Service (Attempt ${attempt}/${MAX_STARTUP_ATTEMPTS})`);
+    console.log('============================================================');
+
+    try {
+        // ✅ Validar variáveis de ambiente críticas
+        const requiredEnvVars = [
+            'DATABASE_URL',
+            'FASTAPI_URL',
+            'CHATBOT_WEBHOOK_SECRET'
+        ];
+
+        const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+        if (missingVars.length > 0) {
+            throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
+        }
+
+        // ✅ Iniciar servidor HTTP ANTES de restaurar sessões
+        server = app.listen(PORT, '0.0.0.0', () => {
+            console.log(`✅ Server running on port ${PORT}`);
+            console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`🕐 Started at: ${new Date().toISOString()}`);
+        });
+
+        // ✅ Aguardar servidor estar pronto
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // ✅ Iniciar monitoramento de recursos
+        startResourceMonitoring();
+        console.log('✅ Resource monitoring started');
+
+        // ✅ Iniciar processador de DLQ
+        startDLQProcessor();
+
+        // ✅ CRÍTICO: Restaurar sessões DEPOIS do servidor estar pronto
+        console.log('🔄 Restoring active sessions...');
+        await whatsappService.restoreActiveSessions();
+        console.log('✅ Session restore completed');
+
+        // ✅ Marcar startup como completo
+        isStartupComplete = true;
+
+        console.log('============================================================');
+        console.log('✅ STARTUP COMPLETED SUCCESSFULLY');
+        console.log('============================================================\n');
+
+    } catch (error) {
+        console.error('\n============================================================');
+        console.error('❌ STARTUP FAILED:', error.message);
+        console.error('============================================================\n');
+
+        // ✅ Retry com backoff exponencial
+        if (attempt < MAX_STARTUP_ATTEMPTS) {
+            const delay = STARTUP_DELAY * attempt;
+            console.log(`⏳ Retrying in ${delay / 1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return startServer(attempt + 1);
+        } else {
+            console.error('❌ Max startup attempts reached. Exiting...');
+            process.exit(1);
         }
     }
 };
 
 // ✅ Iniciar aplicação
-startServer().catch(error => {
-    console.error('❌ Fatal startup error:', error);
-    process.exit(1);
-});
+startServer();
+
+export default app;
