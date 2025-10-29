@@ -1,6 +1,8 @@
-// middleware/security.js - NOVO ARQUIVO
+// middleware/security.js - VERSÃO CORRIGIDA
 import crypto from 'crypto';
+import rateLimit from 'express-rate-limit';
 
+// ✅ CORREÇÃO: Usar crypto.timingSafeEqual diretamente
 export class SecurityManager {
     static timingSafeCompare(a, b) {
         try {
@@ -11,8 +13,10 @@ export class SecurityManager {
                 return false;
             }
 
+            // ✅ CORREÇÃO CRÍTICA: Usar crypto.timingSafeEqual
             return crypto.timingSafeEqual(aBuffer, bBuffer);
         } catch (error) {
+            console.error('Timing safe compare error:', error);
             return false;
         }
     }
@@ -28,7 +32,8 @@ export class SecurityManager {
             });
         }
 
-        if (!this.timingSafeCompare(receivedSecret, expectedSecret)) {
+        // ✅ CORREÇÃO: Usar o método estático corretamente
+        if (!SecurityManager.timingSafeCompare(receivedSecret, expectedSecret)) {
             console.warn(`🔐 Failed authentication attempt from ${req.ip}`);
             return res.status(403).json({
                 error: 'Invalid authentication token',
@@ -59,8 +64,8 @@ export class SecurityManager {
     }
 }
 
-// Rate Limiter Avançado
-import rateLimit from 'express-rate-limit';
+// ✅ CORREÇÃO: Exportação correta para uso no Express
+export const verifyWebhookSecret = SecurityManager.validateWebhookSecret;
 
 export const createRateLimiter = (windowMs, max, message = 'Too many requests') => {
     return rateLimit({
@@ -70,7 +75,6 @@ export const createRateLimiter = (windowMs, max, message = 'Too many requests') 
         standardHeaders: true,
         legacyHeaders: false,
         keyGenerator: (req) => {
-            // Combina IP + user agent + storeId para melhor distribuição
             const storeId = req.body?.storeId || req.params?.storeId || 'unknown';
             return `${req.ip}-${req.get('user-agent')}-${storeId}`.substring(0, 100);
         },
