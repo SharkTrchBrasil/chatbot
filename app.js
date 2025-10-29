@@ -1,4 +1,4 @@
-// app.js - VERSÃO ROBUSTA E SEGURA
+// app.js - VERSÃO ROBUSTA E SEGURA (CORRIGIDO DLQ)
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -94,7 +94,6 @@ const gracefulShutdown = async (signal) => {
     isShuttingDown = true;
     console.log(`\n[SHUTDOWN] 🛑 ${signal} received. Starting graceful shutdown...`);
 
-    // ✅ CORREÇÃO: Aguardar startup completar antes de desligar
     if (!isStartupComplete) {
         console.log('[SHUTDOWN] ⏳ Waiting for startup to complete (max 10s)...');
         let waited = 0;
@@ -157,9 +156,6 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ UNHANDLED REJECTION at:', promise);
     console.error('Reason:', reason);
     console.error('============================================================');
-
-    // ✅ Não fazer shutdown em rejections, apenas logar
-    // Alguns são esperados (ex: timeout de conexão)
 });
 
 // ============================================================
@@ -198,8 +194,25 @@ const startServer = async (attempt = 1) => {
         startResourceMonitoring();
         console.log('✅ Resource monitoring started');
 
-        // ✅ Iniciar processador de DLQ
-        startDLQProcessor();
+        // ============================================================
+        // ✅ CORREÇÃO CRÍTICA (INICIALIZAÇÃO DO DLQ)
+        // ============================================================
+        /**
+         * Fornece o socket (sock) ativo para uma loja específica.
+         * Isso é necessário para o processador da DLQ reenviar mensagens.
+         */
+        const getSocketForStore = (storeId) => {
+            const session = whatsappService.activeSessions.get(String(storeId));
+            // Retorna o socket (sock) apenas se a sessão existir e estiver 'open'
+            if (session && session.status === 'open' && session.sock) {
+                return session.sock;
+            }
+            return null;
+        };
+
+        // ✅ Iniciar processador de DLQ (passando a função necessária)
+        startDLQProcessor(getSocketForStore);
+        // ============================================================
 
         // ✅ CRÍTICO: Restaurar sessões DEPOIS do servidor estar pronto
         console.log('🔄 Restoring active sessions...');

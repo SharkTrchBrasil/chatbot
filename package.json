@@ -8,7 +8,6 @@
     "start": "node app.js",
     "start:dev": "NODE_ENV=development node --watch app.js",
     "start:prod": "NODE_ENV=production node app.js",
-    "start:gc": "node --expose-gc app.js",
     "test": "node --test",
     "lint": "eslint .",
     "format": "prettier --write ."
@@ -18,7 +17,7 @@
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "7.0.0-rc.6",
+    "@whiskeysockets/baileys": "6.7.19",
     "axios": "^1.7.2",
     "compression": "^1.7.4",
     "dotenv": "^16.4.5",
