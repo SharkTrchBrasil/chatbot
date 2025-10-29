@@ -18,10 +18,9 @@ import {
     getGreeting
 } from '../utils/helpers.js';
 
-// ✅ CORREÇÃO: Importar do cacheService, não do whatsappService
-import { conversationStateManager } from '../services/cacheService.js';
+// ✅ CORREÇÃO: Importar o cacheManager global
+import { cacheManager } from '../services/cacheService.js';
 
-// ✅ CORREÇÃO: Importar apenas a constante necessária
 export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000;
 const ABSENCE_COOLDOWN_MS = 10 * 60 * 1000;
 
@@ -31,8 +30,9 @@ const DEFAULT_MESSAGES = {
     internalError: 'Opa, ocorreu um erro interno. Nossa equipe já foi notificada.'
 };
 
-// ✅ Função auxiliar para obter resposta baseada na intenção
+// ✅ Função auxiliar para obter resposta baseada na intenção (sem alteração)
 const getIntentResponse = async (foundIntent, storeId, variables, state) => {
+    // ... (lógica do getIntentResponse) ...
     let replyMessage = null;
 
     if (foundIntent === 'status') {
@@ -77,7 +77,7 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
     try {
         const from = msg.key.remoteJid;
 
-        // ✅ Filtros de segurança
+        // ✅ Filtros de segurança (sem alteração)
         if (!from ||
             from === 'status@broadcast' ||
             from.endsWith('@g.us') ||
@@ -90,12 +90,10 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
         const chatId = from;
         const clientName = msg.pushName || 'Cliente';
 
-        // ✅ CORREÇÃO: Garantir que state tem as propriedades necessárias
         if (!state.chatId) {
             state.chatId = chatId;
         }
 
-        // ✅ Extrair texto da mensagem
         const messageText = msg.message?.conversation ||
                           msg.message?.extendedTextMessage?.text || '';
 
@@ -104,7 +102,7 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             return;
         }
 
-        // ✅ Buscar dados da loja em paralelo
+        // ... (lógica de buscar dados da loja e montar variáveis) ...
         const [storeName, hours, menuSlug, coupons, address] = await Promise.all([
             getStoreName(storeId),
             getBusinessHours(storeId),
@@ -113,7 +111,6 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             getStoreAddress(storeId)
         ]);
 
-        // ✅ Montar variáveis para substituição
         const domain = process.env.PLATFORM_DOMAIN || 'menuhub.com.br';
         const variables = {
             'greeting': getGreeting(),
@@ -128,7 +125,7 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
                 : 'Nenhuma promoção ativa no momento.'
         };
 
-        // ✅ Verificar status da loja (aberta/fechada)
+        // ... (lógica de verificar status da loja) ...
         const storeStatus = await checkStoreStatus(storeId);
         if (storeStatus === 'closed' || storeStatus === 'outside_hours') {
             const now = new Date();
@@ -142,7 +139,7 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             return;
         }
 
-        // ✅ Definir intenções (intents)
+        // ... (lógica de definir intenções) ...
         const intents = {
             status: {
                 regex: /\b(status|meu\s+pedido|onde\s+está|cadê\s+o\s+pedido|acompanhar)\b/i
@@ -170,12 +167,17 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             thanks_goodbye: {
                 regex: /\b(obrigado|obrigada|obg|valeu|tchau|ok|certo|entendi)\b/i,
                 key: 'farewell_message'
+            },
+            // ✅ INTENÇÃO DE SUPORTE HUMANO (PAUSA O BOT)
+            human_support: {
+                 regex: /\b(atendente|humano|suporte|falar\s+com\s+alguém|ajuda)\b/i,
+                 key: 'human_support_message'
             }
         };
 
         state.intents = intents;
 
-        // ✅ Detectar intenção (numérica ou por regex)
+        // ... (lógica de detectar intenção) ...
         let foundIntent = null;
         const menuOption = messageText.trim();
 
@@ -187,12 +189,8 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             foundIntent = 'info';
         } else if (menuOption === '4') {
             foundIntent = 'human_support';
-            // ✅ CORREÇÃO: Pausar bot por 30 minutos
-            state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
-            conversationStateManager.set(chatId, state);
         }
 
-        // ✅ Se não foi opção numérica, tentar regex
         if (!foundIntent) {
             for (const type in intents) {
                 if (messageText.toLowerCase().match(intents[type].regex)) {
@@ -202,19 +200,24 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
             }
         }
 
-        // ✅ Obter resposta apropriada
-        const replyMessage = await getIntentResponse(foundIntent, storeId, variables, state);
+        // ✅ CORREÇÃO: Pausar o bot se a intenção for suporte humano
+        if (foundIntent === 'human_support') {
+            state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
+            // O cacheManager.set será chamado no final
+        }
 
-        // ✅ Enviar resposta
+        // ... (lógica de obter e enviar resposta) ...
+        const replyMessage = await getIntentResponse(foundIntent, storeId, variables, state);
         await replyWithTyping(waSocket, storeId, chatId, replaceVariables(replyMessage, variables));
 
-        // ✅ Atualizar estado no cache
-        conversationStateManager.set(chatId, state);
+        // ✅ CORREÇÃO: Atualizar estado no cache (agora feito no whatsappService.js)
+        // O estado (state) é passado por referência, então as alterações
+        // (como state.lastWelcome) serão salvas pelo whatsappService.js
 
     } catch (error) {
         console.error(`[STORE ${storeId}] ❌ CRITICAL ERROR in processMessage:`, error.message);
         console.error(error.stack);
-
+        // ... (lógica de enviar msg de erro) ...
         if (msg && msg.key && msg.key.remoteJid) {
             try {
                 await replyWithTyping(waSocket, storeId, msg.key.remoteJid, DEFAULT_MESSAGES.internalError);
