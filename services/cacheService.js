@@ -1,32 +1,18 @@
-// services/cacheService.js - VERSÃO CORRIGIDA
+// services/cacheService.js - VERSÃO FINAL CORRIGIDA
 import NodeCache from 'node-cache';
 
 class SecureCacheManager {
     constructor() {
         this.cache = new NodeCache({
             stdTTL: 60,
-            maxKeys: 1000, // ✅ LIMITE RÍGIDO
-            checkperiod: 60,
+            maxKeys: 500, // ⬇️ REDUZIDO de 1000
+            checkperiod: 120, // ⬆️ AUMENTADO de 60
             useClones: false,
             deleteOnExpire: true
         });
 
-        // ✅ MONITORAMENTO DE MEMÓRIA
-        this.memoryThreshold = 0.85; // 85%
-        this.startMemoryMonitoring();
-    }
-
-    startMemoryMonitoring() {
-        setInterval(() => {
-            const usage = process.memoryUsage();
-            const heapUsage = usage.heapUsed / usage.heapTotal;
-
-            if (heapUsage > this.memoryThreshold) {
-                console.warn('🔄 High memory usage, clearing cache...');
-                this.cache.flushAll();
-                if (global.gc) global.gc();
-            }
-        }, 30000);
+        // ✅ REMOVIDO: Monitoramento de memória duplicado
+        // O monitoring.js já faz isso
     }
 
     async get(namespace, key) {
@@ -40,26 +26,33 @@ class SecureCacheManager {
 
             return { found: true, value };
         } catch (error) {
-            console.error('Cache get error:', error);
+            console.error('[CACHE] Get error:', error.message);
             return { found: false, value: null, error: error.message };
         }
     }
 
     async set(namespace, key, value, ttl = 60) {
         try {
-            // ✅ VALIDAÇÃO DE TAMANHO
+            // ✅ VALIDAÇÃO DE TAMANHO RIGOROSA
             const size = Buffer.byteLength(JSON.stringify(value), 'utf8');
-            if (size > 1024 * 1024) { // 1MB max
-                console.warn('Object too large for cache:', size);
+            if (size > 512 * 1024) { // ⬇️ REDUZIDO: 512KB max (era 1MB)
+                console.warn(`[CACHE] Object too large: ${(size / 1024).toFixed(2)}KB`);
                 return false;
             }
 
             const fullKey = `${namespace}:${key}`;
             return this.cache.set(fullKey, value, ttl);
         } catch (error) {
-            console.error('Cache set error:', error);
+            console.error('[CACHE] Set error:', error.message);
             return false;
         }
+    }
+
+    // ✅ NOVO: Método flush público
+    flush() {
+        const count = this.cache.keys().length;
+        this.cache.flushAll();
+        console.log(`[CACHE] ✅ Flushed ${count} keys`);
     }
 
     getStats() {
@@ -68,16 +61,14 @@ class SecureCacheManager {
             keys: stats.keys,
             hits: stats.hits,
             misses: stats.misses,
-            ksize: stats.ksize,
-            vsize: stats.vsize,
-            memoryUsage: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB`
+            hitRate: stats.hits > 0 ? ((stats.hits / (stats.hits + stats.misses)) * 100).toFixed(1) + '%' : '0%'
         };
     }
 
     close() {
-            this.cache.close();
-            console.log('[CACHE] ✅ Cache fechado.');
-        }
+        this.cache.close();
+        console.log('[CACHE] ✅ Closed');
+    }
 }
 
 export const cacheManager = new SecureCacheManager();

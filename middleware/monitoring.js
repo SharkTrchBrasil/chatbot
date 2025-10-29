@@ -1,4 +1,6 @@
-// middleware/monitoring.js - VERSÃO CORRIGIDA PARA PRODUÇÃO
+// middleware/monitoring.js - VERSÃO FINAL CORRIGIDA
+
+import { cacheManager } from '../services/cacheService.js';
 
 class SafeMetricsCollector {
     constructor() {
@@ -10,62 +12,102 @@ class SafeMetricsCollector {
             cacheHits: 0,
             cacheMisses: 0
         };
-
         this.maxHistory = 100;
         this.responseTimes = [];
         this.startTime = Date.now();
     }
 
-    // ... (métodos existentes) ...
+    recordRequest(success, responseTime) {
+        this.metrics.requestsTotal++;
+        if (success) {
+            this.metrics.requestsSuccess++;
+        } else {
+            this.metrics.requestsError++;
+        }
+
+        this.responseTimes.push(responseTime);
+        if (this.responseTimes.length > this.maxHistory) {
+            this.responseTimes.shift();
+        }
+    }
+
+    recordMessage() {
+        this.metrics.messagesProcessed++;
+    }
+
+    recordCacheHit() {
+        this.metrics.cacheHits++;
+    }
+
+    recordCacheMiss() {
+        this.metrics.cacheMisses++;
+    }
+
+    getStats() {
+        const avgResponseTime = this.responseTimes.length > 0
+            ? (this.responseTimes.reduce((a, b) => a + b, 0) / this.responseTimes.length).toFixed(2)
+            : 0;
+
+        return {
+            ...this.metrics,
+            avgResponseTime: `${avgResponseTime}ms`,
+            uptime: `${Math.floor((Date.now() - this.startTime) / 1000)}s`,
+            successRate: this.metrics.requestsTotal > 0
+                ? `${((this.metrics.requestsSuccess / this.metrics.requestsTotal) * 100).toFixed(1)}%`
+                : '0%'
+        };
+    }
 }
 
 export const metricsCollector = new SafeMetricsCollector();
 
-// ✅ CORREÇÃO: MONITORAMENTO OTIMIZADO PARA PRODUÇÃO
+// ✅ CORRIGIDO: Monitoramento otimizado e sem duplicação
 export const startResourceMonitoring = () => {
-    const MONITOR_INTERVAL = 60000; // ⬆️ 1 minuto (era 10s)
-    const MEMORY_THRESHOLD = 0.90; // ⬆️ 90% (era 80%)
-    const GC_THRESHOLD = 0.95; // ⬆️ 95% (era 90%)
+    const MONITOR_INTERVAL = 120000; // ⬆️ 2 minutos (reduz overhead)
+    const MEMORY_THRESHOLD = 0.85;
+    const CRITICAL_THRESHOLD = 0.92;
 
+    let lastCleanup = 0;
     let consecutiveHighMemory = 0;
-    let lastCleanup = Date.now();
 
-    setInterval(() => {
+    const monitor = setInterval(() => {
         const memUsage = process.memoryUsage();
         const heapUtilization = memUsage.heapUsed / memUsage.heapTotal;
+        const now = Date.now();
 
-        // ✅ LOG APENAS SE REALMENTE ALTO
-        if (heapUtilization > 0.85) {
-            console.log(`📊 Memory: ${(heapUtilization * 100).toFixed(1)}%`);
+        // ✅ LOG CONDICIONAL (não polui logs)
+        if (heapUtilization > MEMORY_THRESHOLD) {
+            console.warn(`⚠️ Memory: ${(heapUtilization * 100).toFixed(1)}% | Heap: ${(memUsage.heapUsed / 1024 / 1024).toFixed(1)}MB`);
         }
 
-        // ✅ CLEANUP APENAS SE NECESSÁRIO E NÃO MUITO FREQUENTE
+        // ✅ CLEANUP INTELIGENTE (não excessivo)
         if (heapUtilization > MEMORY_THRESHOLD) {
             consecutiveHighMemory++;
 
-            // ✅ EVITA CLEANUP EXCESSIVO - MÁXIMO 1x POR MINUTO
-            const now = Date.now();
-            if (consecutiveHighMemory >= 2 && (now - lastCleanup) > 60000) {
-                console.warn(`🔄 High memory (${(heapUtilization * 100).toFixed(1)}%), cleaning cache...`);
-
-                // Limpar cache
-                if (global.cacheManager) {
-                    global.cacheManager.flush();
-                }
-
+            // Só limpa se:
+            // 1. Memória alta por 2 ciclos consecutivos
+            // 2. Passou pelo menos 2 minutos desde último cleanup
+            if (consecutiveHighMemory >= 2 && (now - lastCleanup) > 120000) {
+                console.log('🔄 Cleaning cache...');
+                cacheManager.flush();
                 lastCleanup = now;
                 consecutiveHighMemory = 0;
 
-                // GC apenas se disponível e realmente necessário
-                if (global.gc && heapUtilization > GC_THRESHOLD) {
+                // ✅ GC FORÇADO apenas se crítico
+                if (global.gc && heapUtilization > CRITICAL_THRESHOLD) {
+                    console.log('🔧 Running GC...');
                     global.gc();
                 }
             }
-        } else if (consecutiveHighMemory > 0) {
-            consecutiveHighMemory = Math.max(0, consecutiveHighMemory - 1);
+        } else {
+            // Reset contador quando memória normaliza
+            consecutiveHighMemory = 0;
         }
-
     }, MONITOR_INTERVAL);
 
-    console.log(`[MONITOR] ✅ Started (interval: ${MONITOR_INTERVAL}ms, threshold: ${(MEMORY_THRESHOLD * 100).toFixed(0)}%)`);
+    // ✅ IMPORTANTE: Limpar interval no shutdown
+    process.on('SIGTERM', () => clearInterval(monitor));
+    process.on('SIGINT', () => clearInterval(monitor));
+
+    console.log(`[MONITOR] ✅ Started (${MONITOR_INTERVAL / 1000}s interval, ${(MEMORY_THRESHOLD * 100)}% threshold)`);
 };
