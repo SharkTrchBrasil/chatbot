@@ -205,25 +205,41 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         const waSocket = makeWASocket({
             auth: authState.state,
-            version, // ✅ ADICIONADO
+            version,
             printQRInTerminal: false,
             browser: ['PDVix Platform', 'Chrome', '1.0.0'],
             logger: createLogger(sessionId),
 
-            // ✅ CONFIGURAÇÕES OTIMIZADAS PARA MEMÓRIA
+            // ✅ CRÍTICO: Configurações para evitar vazamento de memória
             markOnlineOnConnect: true,
-            syncFullHistory: false, // ✅ CRÍTICO: Evita download de histórico
+            syncFullHistory: false,
             emitOwnEvents: false,
-            getMessage: async () => undefined, // ✅ IMPORTANTE: Não busca mensagens antigas
+            getMessage: async () => undefined,
 
-            // ✅ TIMEOUTS E LIMITES
+            // ✅ TIMEOUTS
             defaultQueryTimeoutMs: 10000,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 30000,
 
-            // ✅ LIMITAR CACHE DE MENSAGENS
-            msgRetryCounterMap: {}, // Não armazena retries
-            patchMessageBeforeSending: (msg) => msg
+            // ✅ MEMÓRIA: Limitar cache interno do Baileys
+            shouldIgnoreJid: (jid) => {
+                // Ignora grupos, broadcasts e status
+                return jid.endsWith('@g.us') ||
+                       jid.endsWith('@broadcast') ||
+                       jid === 'status@broadcast';
+            },
+
+            // ✅ CRÍTICO: Limitar histórico de mensagens
+            msgRetryCounterCache: undefined, // Desabilita cache de retry
+            cachedGroupMetadata: undefined, // Desabilita cache de grupos
+
+            // ✅ PERFORMANCE: Reduzir processamento
+            patchMessageBeforeSending: (msg) => {
+                // Remove campos desnecessários antes de enviar
+                delete msg.messageTimestamp;
+                delete msg.status;
+                return msg;
+            }
         });
 
         sessionEntry.sock = waSocket;

@@ -63,7 +63,7 @@ export const metricsCollector = new SafeMetricsCollector();
 
 // ✅ CORRIGIDO: Monitoramento otimizado e sem duplicação
 export const startResourceMonitoring = () => {
-    const MONITOR_INTERVAL = 120000; // ⬆️ 2 minutos (reduz overhead)
+    const MONITOR_INTERVAL = 120000; // 2 minutos
     const MEMORY_THRESHOLD = 0.85;
     const CRITICAL_THRESHOLD = 0.92;
 
@@ -75,39 +75,56 @@ export const startResourceMonitoring = () => {
         const heapUtilization = memUsage.heapUsed / memUsage.heapTotal;
         const now = Date.now();
 
-        // ✅ LOG CONDICIONAL (não polui logs)
+        // ✅ LOG CONDICIONAL
         if (heapUtilization > MEMORY_THRESHOLD) {
             console.warn(`⚠️ Memory: ${(heapUtilization * 100).toFixed(1)}% | Heap: ${(memUsage.heapUsed / 1024 / 1024).toFixed(1)}MB`);
         }
 
-        // ✅ CLEANUP INTELIGENTE (não excessivo)
+        // ✅ CLEANUP INTELIGENTE
         if (heapUtilization > MEMORY_THRESHOLD) {
             consecutiveHighMemory++;
 
-            // Só limpa se:
-            // 1. Memória alta por 2 ciclos consecutivos
-            // 2. Passou pelo menos 2 minutos desde último cleanup
             if (consecutiveHighMemory >= 2 && (now - lastCleanup) > 120000) {
                 console.log('🔄 Cleaning cache...');
                 cacheManager.flush();
                 lastCleanup = now;
                 consecutiveHighMemory = 0;
 
-                // ✅ GC FORÇADO apenas se crítico
+                // ✅ GC FORÇADO se crítico
                 if (global.gc && heapUtilization > CRITICAL_THRESHOLD) {
                     console.log('🔧 Running GC...');
                     global.gc();
                 }
             }
         } else {
-            // Reset contador quando memória normaliza
             consecutiveHighMemory = 0;
         }
     }, MONITOR_INTERVAL);
 
-    // ✅ IMPORTANTE: Limpar interval no shutdown
-    process.on('SIGTERM', () => clearInterval(monitor));
-    process.on('SIGINT', () => clearInterval(monitor));
+    // ✅ NOVA: Limpeza agressiva a cada 10 minutos
+    const aggressiveCleanup = setInterval(() => {
+        const memUsage = process.memoryUsage();
+        const heapUtilization = memUsage.heapUsed / memUsage.heapTotal;
+
+        if (heapUtilization > 0.80) {
+            console.log('🧹 Aggressive cleanup...');
+            cacheManager.flush();
+
+            if (global.gc) {
+                global.gc();
+                console.log('✅ GC completed');
+            }
+        }
+    }, 600000); // 10 minutos
+
+    // ✅ Limpar intervals no shutdown
+    const cleanup = () => {
+        clearInterval(monitor);
+        clearInterval(aggressiveCleanup);
+    };
+
+    process.on('SIGTERM', cleanup);
+    process.on('SIGINT', cleanup);
 
     console.log(`[MONITOR] ✅ Started (${MONITOR_INTERVAL / 1000}s interval, ${(MEMORY_THRESHOLD * 100)}% threshold)`);
 };

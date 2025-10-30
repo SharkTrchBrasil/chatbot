@@ -1,27 +1,18 @@
-// routes/apiRoutes.js - VERSÃO SEGURA COM CENTRALIZAÇÃO DE AUTH
+// routes/apiRoutes.js - VERSÃO CORRIGIDA COM PREFIXO
 
 import express from 'express';
-// ❌ crypto não é mais necessário aqui
 import rateLimit from 'express-rate-limit';
 import whatsappService from '../services/whatsappService.js';
 import { body, param, validationResult } from 'express-validator';
-// ✅ CORREÇÃO: Importar o middleware de segurança centralizado
 import { verifyWebhookSecret } from '../middleware/security.js';
 
 const router = express.Router();
-// ❌ A variável CHATBOT_WEBHOOK_SECRET não é mais necessária aqui
-// const { CHATBOT_WEBHOOK_SECRET } = process.env;
 
-// ❌ REMOVIDO: Função 'verifySecret' local duplicada.
-// Estamos importando 'verifyWebhookSecret' do 'security.js'
-
-
-// ✅ SEGURANÇA: Rate limiter por loja (Lógica mantida, pois é especializada)
+// ✅ Rate limiters
 const createStoreLimiter = (max, windowMs) => rateLimit({
     windowMs,
     max,
     keyGenerator: (req) => {
-        // Rate limit baseado em storeId + IP
         const storeId = req.body.storeId || req.params.storeId || 'unknown';
         return `${req.ip}-store-${storeId}`;
     },
@@ -32,16 +23,14 @@ const createStoreLimiter = (max, windowMs) => rateLimit({
         });
     },
     standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.ip === '127.0.0.1' // Skip localhost em dev
+    legacyHeaders: false
 });
 
-// ✅ Rate limiters específicos por endpoint (Mantidos)
-const connectionLimiter = createStoreLimiter(10, 15 * 60 * 1000); // 10 conexões a cada 15min
-const messageLimiter = createStoreLimiter(100, 60 * 1000); // 100 mensagens por minuto
-const statusLimiter = createStoreLimiter(60, 60 * 1000); // 60 updates por minuto
+const connectionLimiter = createStoreLimiter(10, 15 * 60 * 1000);
+const messageLimiter = createStoreLimiter(100, 60 * 1000);
+const statusLimiter = createStoreLimiter(60, 60 * 1000);
 
-// ✅ Middleware de validação de erros (Mantido)
+// ✅ Validação
 const validateRequest = (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -53,23 +42,21 @@ const validateRequest = (req, res, next) => {
     next();
 };
 
-// ✅ Aplicar security middleware
-// ✅ CORREÇÃO: Usando a função importada
+// ✅ APLICAR SEGURANÇA
 router.use(verifyWebhookSecret);
 
-// ✅ ENDPOINT: Iniciar sessão com validação completa
+// ✅ ENDPOINT: Iniciar sessão
 router.post('/start-session',
     connectionLimiter,
     [
-        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
-        body('method').isIn(['qr', 'pairing']).withMessage('method must be "qr" or "pairing"'),
-        body('phoneNumber').optional().matches(/^\d{10,15}$/).withMessage('phoneNumber must be 10-15 digits')
+        body('storeId').isInt({ min: 1 }),
+        body('method').isIn(['qr', 'pairing']),
+        body('phoneNumber').optional().matches(/^\d{10,15}$/)
     ],
     validateRequest,
     async (req, res) => {
         const { storeId, phoneNumber, method } = req.body;
 
-        // ✅ Validação condicional
         if (method === 'pairing' && !phoneNumber) {
             return res.status(400).json({
                 error: 'phoneNumber is required for pairing method'
@@ -77,7 +64,6 @@ router.post('/start-session',
         }
 
         const session = whatsappService.activeSessions.get(String(storeId));
-
         if (session && ['connecting', 'open'].includes(session.status)) {
             return res.status(200).json({
                 message: `Session is already ${session.status}`,
@@ -102,53 +88,44 @@ router.post('/start-session',
     }
 );
 
-// ... (O restante do arquivo 'apiRoutes.js' permanece exatamente o mesmo) ...
-// (disconnect, send-message, update-status, pause-chat, profile-picture, contact-name, health)
-
-// ✅ ENDPOINT: Desconectar sessão
+// ✅ ENDPOINT: Desconectar
 router.post('/disconnect',
     connectionLimiter,
-    [
-        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer')
-    ],
+    [body('storeId').isInt({ min: 1 })],
     validateRequest,
     async (req, res) => {
         const { storeId } = req.body;
 
         try {
-            console.log(`[API] Disconnecting store ${storeId}`);
             await whatsappService.disconnectSession(storeId);
-
             res.status(200).json({
                 message: 'Disconnection completed',
                 storeId
             });
         } catch (error) {
-            console.error(`[API] Failed to disconnect store ${storeId}:`, error.message);
+            console.error(`[API] Failed to disconnect:`, error.message);
             res.status(500).json({
-                error: 'Failed to disconnect',
-                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                error: 'Failed to disconnect'
             });
         }
     }
 );
 
-// ✅ ENDPOINT: Enviar mensagem com validação
+// ✅ ENDPOINT: Enviar mensagem
 router.post('/send-message',
     messageLimiter,
     [
-        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
-        body('number').matches(/^\d{10,15}$/).withMessage('number must be 10-15 digits'),
-        body('message').optional().isString().isLength({ max: 4096 }).withMessage('message too long'),
-        body('mediaUrl').optional().isURL().withMessage('mediaUrl must be a valid URL'),
-        body('mediaType').optional().isIn(['image', 'audio', 'document']).withMessage('Invalid mediaType'),
+        body('storeId').isInt({ min: 1 }),
+        body('number').matches(/^\d{10,15}$/),
+        body('message').optional().isString().isLength({ max: 4096 }),
+        body('mediaUrl').optional().isURL(),
+        body('mediaType').optional().isIn(['image', 'audio', 'document']),
         body('mediaFilename').optional().isString().isLength({ max: 255 })
     ],
     validateRequest,
     async (req, res) => {
         const { storeId, number, message, mediaUrl, mediaType, mediaFilename } = req.body;
 
-        // ✅ Validação: mensagem OU mídia obrigatória
         if (!message && !mediaUrl) {
             return res.status(400).json({
                 error: 'Either message or mediaUrl is required'
@@ -179,33 +156,29 @@ router.post('/send-message',
                 });
             }
         } catch (error) {
-            console.error(`[API] Failed to send message for store ${storeId}:`, error.message);
+            console.error(`[API] Failed to send message:`, error.message);
             res.status(500).json({
-                error: 'Failed to send message',
-                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                error: 'Failed to send message'
             });
         }
     }
 );
 
-// ✅ ENDPOINT: Atualizar status de atividade
+// ✅ ENDPOINT: Atualizar status
 router.post('/update-status',
     statusLimiter,
     [
-        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
-        body('isActive').isBoolean().withMessage('isActive must be boolean')
+        body('storeId').isInt({ min: 1 }),
+        body('isActive').isBoolean()
     ],
     validateRequest,
     (req, res) => {
         const { storeId, isActive } = req.body;
-
         const session = whatsappService.activeSessions.get(String(storeId));
 
         if (session && session.status === 'open') {
             session.isActive = isActive;
             whatsappService.activeSessions.set(String(storeId), session);
-
-            console.log(`[API] Store ${storeId} activity status: ${isActive}`);
 
             res.status(200).json({
                 message: 'Status updated successfully',
@@ -221,12 +194,12 @@ router.post('/update-status',
     }
 );
 
-// ✅ ENDPOINT: Pausar chat para atendimento humano
+// ✅ ENDPOINT: Pausar chat
 router.post('/pause-chat',
     statusLimiter,
     [
-        body('storeId').isInt({ min: 1 }).withMessage('storeId must be a positive integer'),
-        body('chatId').matches(/^\d+@s\.whatsapp\.net$/).withMessage('Invalid chatId format')
+        body('storeId').isInt({ min: 1 }),
+        body('chatId').matches(/^\d+@s\.whatsapp\.net$/)
     ],
     validateRequest,
     (req, res) => {
@@ -249,10 +222,9 @@ router.post('/pause-chat',
                 });
             }
         } catch (error) {
-            console.error(`[API] Failed to pause chat for store ${storeId}:`, error.message);
+            console.error(`[API] Failed to pause chat:`, error.message);
             res.status(500).json({
-                error: 'Failed to pause chat',
-                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                error: 'Failed to pause chat'
             });
         }
     }
@@ -286,8 +258,7 @@ router.get('/profile-picture/:storeId/:chatId',
         } catch (error) {
             console.error(`[API] Failed to fetch profile picture:`, error.message);
             res.status(500).json({
-                error: 'Failed to fetch profile picture',
-                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                error: 'Failed to fetch profile picture'
             });
         }
     }
@@ -321,29 +292,10 @@ router.get('/contact-name/:storeId/:chatId',
         } catch (error) {
             console.error(`[API] Failed to fetch contact name:`, error.message);
             res.status(500).json({
-                error: 'Failed to fetch contact name',
-                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                error: 'Failed to fetch contact name'
             });
         }
     }
 );
-
-// ✅ ENDPOINT: Health check (sem autenticação)
-router.get('/health', (req, res) => {
-    const activeSessions = whatsappService.activeSessions.size;
-    const openSessions = Array.from(whatsappService.activeSessions.values())
-        .filter(s => s.status === 'open').length;
-
-    res.status(200).json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        sessions: {
-            total: activeSessions,
-            connected: openSessions
-        },
-        uptime: process.uptime(),
-        memory: process.memoryUsage()
-    });
-});
 
 export default router;
