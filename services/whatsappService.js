@@ -1,4 +1,4 @@
-// services/whatsappService.js - VERSÃO HÍBRIDA (DB + Filesystem) COM ANTI-BAN
+// services/whatsappService.js - VERSÃO FINAL COMPLETA E CORRIGIDA
 
 import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -15,23 +15,50 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ============================================================
+// 🔧 CONFIGURAÇÕES GLOBAIS
+// ============================================================
+
 const activeSessions = new Map();
 const PLATFORM_BOT_ID = 'platform';
-export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000;
+export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000; // 30 minutos
 const MAX_RESTORE_ATTEMPTS = 3;
-const SESSION_RESTORE_DELAY = 10000; // ⬆️ AUMENTADO: 10s entre tentativas
+const SESSION_RESTORE_DELAY = 10000; // 10 segundos
 
 let isRestoringComplete = false;
 
-// ✅ Diretório temporário (sincronizado com DB)
+// ✅ Diretório para autenticação
 const AUTH_DIR = path.join(__dirname, '..', 'auth_sessions');
 
-// ✅ ANTI-BAN: Delay entre operações
-const OPERATION_DELAY = 2000;
+// ✅ ANTI-BAN: Delays e controles
+const OPERATION_DELAY = 2000; // 2 segundos entre operações
 const antiSpamDelay = () => new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
-const credsSaveTimers = new Map(); // ⬅️ NOVO: Rastrear por sessão
+const credsSaveTimers = new Map(); // Timer para throttle de salvamento
 
-// ✅ Garantir diretório
+// ✅ DEDUPLICAÇÃO: Rastreamento de mensagens processadas
+const processedMessages = new Map();
+const MESSAGE_DEDUP_TTL = 60000; // 1 minuto
+
+// ✅ Limpeza automática do Map de mensagens processadas
+const cleanupProcessedMessages = () => {
+    const now = Date.now();
+    for (const [key, timestamp] of processedMessages.entries()) {
+        if (now - timestamp > MESSAGE_DEDUP_TTL) {
+            processedMessages.delete(key);
+        }
+    }
+};
+
+// Executar limpeza a cada 2 minutos
+setInterval(cleanupProcessedMessages, 120000);
+
+// ============================================================
+// 📁 FUNÇÕES DE GERENCIAMENTO DE AUTENTICAÇÃO
+// ============================================================
+
+/**
+ * Garante que o diretório de autenticação existe
+ */
 const ensureAuthDir = async () => {
     try {
         await fs.mkdir(AUTH_DIR, { recursive: true });
@@ -40,35 +67,9 @@ const ensureAuthDir = async () => {
     }
 };
 
-// ✅ CORREÇÃO 1: Substitua a função createLogger (por volta da linha ~45)
-
-const createLogger = (sessionId) => ({
-    level: 'silent',
-    trace: () => {},
-    debug: () => {},
-    info: () => {},
-    warn: (msg) => {
-        // ✅ CONVERTER PARA STRING PRIMEIRO
-        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
-
-        if (msgStr.includes('myAppStateKeyId') || msgStr.includes('no name present')) {
-            return;
-        }
-        console.warn(`[SESSION ${sessionId}][WARN]`, msgStr);
-    },
-    error: (msg) => {
-        // ✅ CONVERTER PARA STRING PRIMEIRO
-        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
-
-        if (typeof msg === 'object' && msg?.node?.attrs?.code === '515') {
-            return;
-        }
-        console.error(`[SESSION ${sessionId}][ERROR]`, msgStr);
-    },
-    child: () => createLogger(sessionId)
-});
-
-
+/**
+ * Salva credenciais no banco de dados
+ */
 const saveCredsToDatabase = async (sessionId, creds) => {
     const client = await pool.connect();
     try {
@@ -78,14 +79,14 @@ const saveCredsToDatabase = async (sessionId, creds) => {
             [`store_${sessionId}`]
         );
 
-        // âœ… ADICIONAR updated_at NA QUERY
+        // Salvar nova credencial
         await client.query(
             `INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value, updated_at)
              VALUES ($1, $2, $3, NOW())`,
             [`store_${sessionId}`, 'creds', creds]
         );
 
-        console.log(`[DB] âœ… Credentials saved for store ${sessionId}`);
+        console.log(`[DB] ✅ Credentials saved for store ${sessionId}`);
     } catch (err) {
         console.error(`[DB] Failed to save creds for store ${sessionId}:`, err.message);
     } finally {
@@ -93,8 +94,9 @@ const saveCredsToDatabase = async (sessionId, creds) => {
     }
 };
 
-
-
+/**
+ * Carrega credenciais do banco de dados
+ */
 const loadCredsFromDatabase = async (sessionId) => {
     const client = await pool.connect();
     try {
@@ -117,7 +119,9 @@ const loadCredsFromDatabase = async (sessionId) => {
     }
 };
 
-
+/**
+ * Limpa credenciais do banco de dados
+ */
 const clearCredsFromDatabase = async (sessionId) => {
     const client = await pool.connect();
     try {
@@ -133,35 +137,43 @@ const clearCredsFromDatabase = async (sessionId) => {
     }
 };
 
-
+/**
+ * Limpa todas as conversas e mensagens de uma loja
+ */
 const cleanupStoreConversations = async (storeId) => {
     const client = await pool.connect();
     try {
         console.log(`[CLEANUP] 🧹 Starting cleanup for store ${storeId}...`);
 
-        // ✅ 1. Deletar todas as mensagens do chatbot
+        // 1. Deletar mensagens
         const messagesResult = await client.query(
             'DELETE FROM chatbot_messages WHERE store_id = $1',
             [storeId]
         );
         console.log(`[CLEANUP] ✅ Deleted ${messagesResult.rowCount} messages`);
 
-        // ✅ 2. Deletar todos os metadados de conversa
+        // 2. Deletar metadados
         const metadataResult = await client.query(
             'DELETE FROM chatbot_conversation_metadata WHERE store_id = $1',
             [storeId]
         );
         console.log(`[CLEANUP] ✅ Deleted ${metadataResult.rowCount} conversation metadata entries`);
 
-        // ✅ 3. Limpar cache de conversas (se estiver usando Redis/cache)
+        // 3. Limpar cache usando deletePattern
         try {
-            // Exemplo: se você está usando cacheManager
-            const cacheKey = `store:${storeId}:conversations`;
-            await cacheManager.delete('conversationState', cacheKey);
-            console.log(`[CLEANUP] ✅ Cleared conversation cache`);
+            const deletedCount = await cacheManager.deletePattern('conversationState', '*');
+            console.log(`[CLEANUP] ✅ Cleared ${deletedCount} cache entries`);
         } catch (err) {
             console.warn(`[CLEANUP] ⚠️ Cache clear warning:`, err.message);
         }
+
+        // 4. Limpar mensagens processadas do Map
+        for (const [key] of processedMessages.entries()) {
+            if (key.startsWith(`${storeId}:`)) {
+                processedMessages.delete(key);
+            }
+        }
+        console.log(`[CLEANUP] ✅ Cleared processed messages map for store ${storeId}`);
 
         console.log(`[CLEANUP] ✅ Cleanup complete for store ${storeId}`);
         return true;
@@ -173,6 +185,10 @@ const cleanupStoreConversations = async (storeId) => {
         client.release();
     }
 };
+
+/**
+ * Obtém ou cria o estado de autenticação
+ */
 const getAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
@@ -209,6 +225,9 @@ const getAuthState = async (sessionId) => {
     }
 };
 
+/**
+ * Limpa o estado de autenticação (filesystem + database)
+ */
 const clearAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
@@ -221,7 +240,46 @@ const clearAuthState = async (sessionId) => {
     }
 };
 
+/**
+ * Cria logger personalizado com supressão de warnings desnecessários
+ */
+const createLogger = (sessionId) => ({
+    level: 'silent',
+    trace: () => {},
+    debug: () => {},
+    info: () => {},
+    warn: (msg) => {
+        // Converter para string primeiro
+        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
 
+        if (msgStr.includes('myAppStateKeyId') || msgStr.includes('no name present')) {
+            return;
+        }
+        console.warn(`[SESSION ${sessionId}][WARN]`, msgStr);
+    },
+    error: (msg) => {
+        // Converter para string primeiro
+        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
+
+        if (typeof msg === 'object' && msg?.node?.attrs?.code === '515') {
+            return;
+        }
+        console.error(`[SESSION ${sessionId}][ERROR]`, msgStr);
+    },
+    child: () => createLogger(sessionId)
+});
+
+// ============================================================
+// 🚀 FUNÇÃO PRINCIPAL: startSession
+// ============================================================
+
+/**
+ * Inicia ou reconecta uma sessão do WhatsApp
+ * @param {string|number} sessionId - ID da loja
+ * @param {string} phoneNumber - Número para pairing code
+ * @param {string} method - 'qr' ou 'pairing'
+ * @param {number} attempt - Tentativa atual (para retry)
+ */
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -233,7 +291,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
     console.log(`[SESSION ${sessionId}] Starting (${method}, attempt ${attempt})...`);
 
-    // ✅ ANTI-BAN: Delay entre tentativas
+    // ANTI-BAN: Delay entre tentativas
     if (attempt > 1) {
         await antiSpamDelay();
     }
@@ -249,13 +307,12 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             messageCount: 0,
             lastNotifiedStatus: null,
             connectionStabilizedAt: null,
-            isNotifying: false // ⬅️ NOVO: Flag para evitar notificações simultâneas
+            isNotifying: false
         };
 
         activeSessions.set(String(sessionId), sessionEntry);
 
         const { state, saveCreds } = await getAuthState(sessionId);
-
         const hasValidCreds = state.creds?.me?.id;
 
         if (hasValidCreds) {
@@ -266,7 +323,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         const { version } = await fetchLatestBaileysVersion();
 
-        // ✅ ANTI-BAN: Configurações conservadoras
+        // ANTI-BAN: Configurações conservadoras
         const waSocket = makeWASocket({
             auth: state,
             version,
@@ -274,7 +331,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             browser: ['PDVix', 'Chrome', '120.0.0'],
             logger: createLogger(sessionId),
 
-            // ✅ ANTI-BAN CRÍTICO
+            // ANTI-BAN CRÍTICO
             syncFullHistory: false,
             markOnlineOnConnect: false,
             emitOwnEvents: false,
@@ -284,24 +341,24 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 return { conversation: '' };
             },
 
-            // ✅ Timeouts aumentados
+            // Timeouts aumentados
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 45000,
             qrTimeout: 60000,
 
-            // ✅ Filtros
+            // Filtros
             shouldIgnoreJid: (jid) => {
                 return jid.endsWith('@g.us') ||
                        jid.endsWith('@broadcast') ||
                        jid === 'status@broadcast';
             },
 
-            // ✅ ANTI-BAN: Retry conservador
+            // ANTI-BAN: Retry conservador
             retryRequestDelayMs: 500,
             maxMsgRetryCount: 2,
 
-            // ✅ Link preview
+            // Link preview
             linkPreviewImageThumbnailWidth: 192,
             transactionOpts: {
                 maxCommitRetries: 2,
@@ -311,7 +368,9 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         sessionEntry.sock = waSocket;
 
-        // ✅ EVENT: Salvar credenciais (COM THROTTLE CORRETO)
+        // ============================================================
+        // EVENT: Salvar credenciais (COM THROTTLE)
+        // ============================================================
         waSocket.ev.on('creds.update', async () => {
             const sessionIdStr = String(sessionId);
 
@@ -333,7 +392,9 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             credsSaveTimers.set(sessionIdStr, timer);
         });
 
-        // ✅ EVENT: Connection (CORRIGIDO)
+        // ============================================================
+        // EVENT: Connection Update
+        // ============================================================
         waSocket.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
@@ -343,13 +404,13 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             }
 
             if (connection === 'open') {
-                // ✅ VALIDAÇÃO: Aguardar user ID
+                // Validação: Aguardar user ID
                 if (!waSocket.user?.id) {
                     console.warn(`[SESSION ${sessionId}] ⚠️ Connection open, but no user ID yet`);
                     return;
                 }
 
-                // ✅ Evitar notificações duplicadas
+                // Evitar notificações duplicadas
                 if (sessionEntry.lastNotifiedStatus === 'open') {
                     console.log(`[SESSION ${sessionId}] ℹ️ Already notified as connected`);
                     return;
@@ -365,7 +426,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
                 console.log(`[SESSION ${sessionId}] ✅ Connected as ${userName}`);
 
-                // ✅ ANTI-BAN: Delay antes de notificar
+                // Delay antes de notificar
                 await antiSpamDelay();
 
                 if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
@@ -386,7 +447,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             }
 
             if (qr) {
-                // ✅ Evitar notificar QR múltiplas vezes
+                // Evitar notificar QR múltiplas vezes
                 if (sessionEntry.lastNotifiedStatus !== 'awaiting_qr') {
                     console.log(`[SESSION ${sessionId}] 📲 QR Code generated`);
                     sessionEntry.lastNotifiedStatus = 'awaiting_qr';
@@ -405,338 +466,450 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 }
             }
 
-          if (connection === 'close') {
-              const statusCode = lastDisconnect?.error?.output?.statusCode;
-              const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-              sessionEntry.status = 'disconnected';
+                sessionEntry.status = 'disconnected';
+                const shouldNotifyDisconnect = sessionEntry.lastNotifiedStatus === 'open';
 
-              const shouldNotifyDisconnect = sessionEntry.lastNotifiedStatus === 'open';
+                // MAPEAMENTO DE ERROS CLAROS
+                const errorMessages = {
+                    401: 'Device removed - User logged out from phone',
+                    403: 'Access forbidden',
+                    408: 'Request timeout',
+                    440: 'Device logout',
+                    428: 'Connection closed',
+                    515: 'Rate limit exceeded',
+                    503: 'Service unavailable'
+                };
 
-              // ✅ Logs informativos
-              if (statusCode === 515) {
-                  console.log(`[SESSION ${sessionId}] ⚠️ Rate limit (515) - waiting before retry`);
-              } else if (statusCode === 401) {
-                  console.log(`[SESSION ${sessionId}] ❌ Unauthorized (401) - clearing auth`);
-                  // ✅ NOVO: Limpar conversas em caso de 401
-                  await cleanupStoreConversations(sessionId);
-              } else if (statusCode === 440) {
-                  console.log(`[SESSION ${sessionId}] ❌ Device logout (440) - clearing everything`);
-                  // ✅ NOVO: Limpar conversas em caso de logout do dispositivo
-                  await cleanupStoreConversations(sessionId);
-              } else {
-                  console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode || 'unknown'})`);
-              }
+                const errorMsg = errorMessages[statusCode] || `Unknown error (${statusCode})`;
+                console.log(`[SESSION ${sessionId}] ❌ Closed: ${errorMsg}`);
 
-              // ✅ Limpar auth em casos críticos
-              if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
-                  await clearAuthState(sessionId);
-                  // ✅ NOVO: Também limpar conversas nestes casos
-                  await cleanupStoreConversations(sessionId);
-              }
+                // TRATAMENTO ESPECÍFICO POR CÓDIGO
+                const criticalErrors = [401, 403, 440, DisconnectReason.loggedOut];
 
-              // ✅ ANTI-BAN: Retry com backoff exponencial
-              if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
-                  let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
+                if (criticalErrors.includes(statusCode)) {
+                    console.log(`[SESSION ${sessionId}] 🗑️ Critical error - cleaning up...`);
 
-                  if (statusCode === 515) {
-                      delay = Math.max(delay, 30000);
-                  }
+                    // Limpar auth e conversas
+                    await Promise.all([
+                        clearAuthState(sessionId),
+                        cleanupStoreConversations(sessionId)
+                    ]);
 
-                  delay = Math.min(delay, 120000);
+                    // Não reconectar em erros críticos
+                    activeSessions.delete(String(sessionId));
 
-                  console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s...`);
-
-                  activeSessions.delete(String(sessionId));
-
-                  setTimeout(() => {
-                      startSession(sessionId, phoneNumber, method, attempt + 1);
-                  }, delay);
-              } else {
-                  activeSessions.delete(String(sessionId));
-              }
-
-              // ✅ Apenas notificar se realmente estava conectado
-              if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect && !sessionEntry.isNotifying) {
-                  sessionEntry.isNotifying = true;
-
-                  notifyFastAPI({
-                      storeId: sessionId,
-                      status: 'disconnected',
-                      reason: statusCode ? `Error ${statusCode}` : 'Unknown'
-                  }).catch(() => {}).finally(() => {
-                      sessionEntry.isNotifying = false;
-                  });
-              }
-          }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        });
-
-        // ✅ EVENT: Mensagens
-        waSocket.ev.on('messages.upsert', async (m) => {
-            for (const msg of m.messages || []) {
-                if (!msg?.key?.remoteJid || !msg.message || msg.key.fromMe) continue;
-
-                const chatId = msg.key.remoteJid;
-                if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) continue;
-
-                sessionEntry.messageCount++;
-                if (sessionEntry.messageCount > 50) {
-                    await antiSpamDelay();
-                    sessionEntry.messageCount = 0;
-                }
-
-                if (sessionId !== PLATFORM_BOT_ID) {
-                    updateConversationMetadata(sessionId, msg).catch(() => {});
-
-                    const cacheKey = `state:${chatId}`;
-                    let stateResult = await cacheManager.get('conversationState', cacheKey);
-                    let state = stateResult?.value || {};
-
-                    if (!state.humanSupportUntil || new Date() >= new Date(state.humanSupportUntil)) {
-                        await processMessage(msg, sessionId, waSocket, state).catch(err => {
-                            console.error(`[SESSION ${sessionId}] Message processing error:`, err.message);
-                        });
-
-                        await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
+                    // Notificar desconexão definitiva
+                    if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect) {
+                        notifyFastAPI({
+                            storeId: sessionId,
+                            status: 'disconnected',
+                            reason: errorMsg,
+                            requiresManualReconnection: true
+                        }).catch(() => {});
                     }
+
+                    return; // Parar aqui
                 }
 
-                forwardMessageToFastAPI(sessionId, msg, waSocket).catch(() => {});
-            }
-        });
+                // RATE LIMIT (515) - Aguardar mais tempo
+                if (statusCode === 515) {
+                    console.log(`[SESSION ${sessionId}] ⏳ Rate limit - waiting 60s before retry`);
 
-        // ✅ PAIRING CODE
-        if (method === 'pairing' && phoneNumber) {
-            try {
-                console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
-                await antiSpamDelay();
+                    if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                        activeSessions.delete(String(sessionId));
 
-                const code = await waSocket.requestPairingCode(phoneNumber);
-                const formatted = code.match(/.{1,4}/g).join('-');
+                        setTimeout(() => {
+                            startSession(sessionId, phoneNumber, method, attempt + 1);
+                        }, 60000); // 60 segundos
+                    }
+                    return;
+                }
 
-                console.log(`[SESSION ${sessionId}] ✅ Pairing Code: ${formatted}`);
+                // RECONEXÃO AUTOMÁTICA PARA ERROS TEMPORÁRIOS
+                if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                    // Backoff exponencial
+                    let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
+                    delay = Math.min(delay, 120000); // Máximo 2 minutos
 
-                if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
+                    console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s... (attempt ${attempt + 1}/${MAX_RESTORE_ATTEMPTS})`);
+
+                    activeSessions.delete(String(sessionId));
+
+                    setTimeout(() => {
+                        startSession(sessionId, phoneNumber, method, attempt + 1);
+                    }, delay);
+                } else {
+                    console.log(`[SESSION ${sessionId}] ⛔ Max retries reached or not reconnectable`);
+                    activeSessions.delete(String(sessionId));
+                }
+
+                // NOTIFICAR DESCONEXÃO (só se estava conectado)
+                if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect && !sessionEntry.isNotifying) {
                     sessionEntry.isNotifying = true;
 
                     notifyFastAPI({
                         storeId: sessionId,
-                        status: 'awaiting_pairing_code',
-                        pairingCode: code
+                        status: 'disconnected',
+                        reason: errorMsg,
+                        willRetry: shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS
                     }).catch(() => {}).finally(() => {
                         sessionEntry.isNotifying = false;
                     });
                 }
-            } catch (err) {
-                console.error(`[SESSION ${sessionId}] Pairing error:`, err.message);
-                sessionEntry.status = 'error';
+            }
+        });
 
-                if (waSocket.end) {
-                    waSocket.end(undefined);
+
+        // ============================================================
+                // EVENT: Mensagens Recebidas (COM DEDUPLICAÇÃO)
+                // ============================================================
+                waSocket.ev.on('messages.upsert', async (m) => {
+                    for (const msg of m.messages || []) {
+                        // Validações básicas
+                        if (!msg?.key?.remoteJid || !msg.message || msg.key.fromMe) continue;
+
+                        const chatId = msg.key.remoteJid;
+                        const messageId = msg.key.id;
+
+                        // Filtrar grupos e broadcasts
+                        if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast') || chatId === 'status@broadcast') {
+                            continue;
+                        }
+
+                        // CRÍTICO: Deduplicação de mensagens
+                        const dedupKey = `${sessionId}:${chatId}:${messageId}`;
+                        if (processedMessages.has(dedupKey)) {
+                            console.log(`[SESSION ${sessionId}] ⏭️ Skipping duplicate message: ${messageId}`);
+                            continue;
+                        }
+
+                        // CRÍTICO: Ignorar mensagens muito antigas (mais de 5 minutos)
+                        const messageTimestamp = msg.messageTimestamp * 1000;
+                        const messageAge = Date.now() - messageTimestamp;
+
+                        if (messageAge > 5 * 60 * 1000) {
+                            console.log(`[SESSION ${sessionId}] ⏭️ Skipping old message (${Math.floor(messageAge / 1000)}s old): ${messageId}`);
+                            processedMessages.set(dedupKey, Date.now()); // Marcar como processada
+                            continue;
+                        }
+
+                        // Validar conteúdo da mensagem
+                        const hasContent = msg.message?.conversation ||
+                                          msg.message?.extendedTextMessage?.text ||
+                                          msg.message?.imageMessage ||
+                                          msg.message?.audioMessage ||
+                                          msg.message?.videoMessage ||
+                                          msg.message?.documentMessage;
+
+                        if (!hasContent) {
+                            console.log(`[SESSION ${sessionId}] ⏭️ Skipping message without content: ${messageId}`);
+                            continue;
+                        }
+
+                        // Marcar como processada
+                        processedMessages.set(dedupKey, Date.now());
+
+                        // Anti-spam
+                        sessionEntry.messageCount++;
+                        if (sessionEntry.messageCount > 50) {
+                            await antiSpamDelay();
+                            sessionEntry.messageCount = 0;
+                        }
+
+                        // Processar apenas mensagens de clientes (não da plataforma)
+                        if (sessionId !== PLATFORM_BOT_ID) {
+                            // Atualizar metadata (sem bloquear)
+                            updateConversationMetadata(sessionId, msg).catch((err) => {
+                                console.error(`[SESSION ${sessionId}] Metadata update failed:`, err.message);
+                            });
+
+                            // Obter estado da conversa
+                            const cacheKey = `state:${chatId}`;
+                            let stateResult = await cacheManager.get('conversationState', cacheKey);
+                            let state = stateResult?.value || {};
+
+                            // Verificar se está pausado para suporte humano
+                            if (!state.humanSupportUntil || new Date() >= new Date(state.humanSupportUntil)) {
+                                // Processar mensagem com o chatbot
+                                await processMessage(msg, sessionId, waSocket, state).catch(err => {
+                                    console.error(`[SESSION ${sessionId}] Message processing error:`, err.message);
+                                });
+
+                                // Salvar estado atualizado
+                                await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
+                            } else {
+                                console.log(`[SESSION ${sessionId}] Chat ${chatId} paused for human support`);
+                            }
+                        }
+
+                        // Encaminhar para FastAPI (sem bloquear)
+                        forwardMessageToFastAPI(sessionId, msg, waSocket).catch((err) => {
+                            console.error(`[SESSION ${sessionId}] Forward failed for ${messageId}:`, err.message);
+                        });
+                    }
+                });
+
+                // ============================================================
+                // PAIRING CODE (se método for 'pairing')
+                // ============================================================
+                if (method === 'pairing' && phoneNumber) {
+                    try {
+                        console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
+                        await antiSpamDelay();
+
+                        const code = await waSocket.requestPairingCode(phoneNumber);
+                        const formatted = code.match(/.{1,4}/g).join('-');
+
+                        console.log(`[SESSION ${sessionId}] ✅ Pairing Code: ${formatted}`);
+
+                        if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
+                            sessionEntry.isNotifying = true;
+
+                            notifyFastAPI({
+                                storeId: sessionId,
+                                status: 'awaiting_pairing_code',
+                                pairingCode: code
+                            }).catch(() => {}).finally(() => {
+                                sessionEntry.isNotifying = false;
+                            });
+                        }
+                    } catch (err) {
+                        console.error(`[SESSION ${sessionId}] Pairing error:`, err.message);
+                        sessionEntry.status = 'error';
+
+                        if (waSocket.end) {
+                            waSocket.end(undefined);
+                        }
+
+                        await clearAuthState(sessionId);
+                        activeSessions.delete(String(sessionId));
+                    }
                 }
+
+            } catch (error) {
+                console.error(`[SESSION ${sessionId}] CRITICAL ERROR:`, error.message);
+
+                const entry = activeSessions.get(String(sessionId));
+                if (entry) {
+                    entry.status = 'error';
+                    entry.lastError = error.message;
+                }
+
+                if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                    const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 120000);
+                    setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), delay);
+                }
+            }
+        };
+
+        // ============================================================
+        // 🔧 FUNÇÕES AUXILIARES
+        // ============================================================
+
+        /**
+         * Desconecta uma sessão e limpa todos os dados
+         */
+        const disconnectSession = async (sessionId) => {
+            const session = activeSessions.get(String(sessionId));
+            try {
+                if (session?.sock) {
+                    session.sock.logout();
+                }
+
+                // Limpar conversas ao desconectar
+                await cleanupStoreConversations(sessionId);
 
                 await clearAuthState(sessionId);
                 activeSessions.delete(String(sessionId));
+
+                if (sessionId !== PLATFORM_BOT_ID) {
+                    notifyFastAPI({ storeId: sessionId, status: 'disconnected' }).catch(() => {});
+                }
+            } catch (err) {
+                console.error(`[SESSION ${sessionId}] Disconnect error:`, err.message);
             }
-        }
+        };
 
-    } catch (error) {
-        console.error(`[SESSION ${sessionId}] CRITICAL ERROR:`, error.message);
+        /**
+         * Envia mensagem (COM ANTI-BAN)
+         */
+        const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename) => {
+            const session = activeSessions.get(String(sessionId));
+            if (!session?.sock || session.status !== 'open' || !session.sock.user) return false;
 
-        const entry = activeSessions.get(String(sessionId));
-        if (entry) {
-            entry.status = 'error';
-            entry.lastError = error.message;
-        }
+            try {
+                // ANTI-BAN: Delay entre mensagens
+                await antiSpamDelay();
 
-        if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
-            const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 120000);
-            setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), delay);
-        }
-    }
-};
+                const chatId = `${number.replace(/\D/g, '')}@s.whatsapp.net`;
+                let payload;
 
-// ✅ ATUALIZE A FUNÇÃO disconnectSession
-const disconnectSession = async (sessionId) => {
-    const session = activeSessions.get(String(sessionId));
-    try {
-        if (session?.sock) {
-            session.sock.logout();
-        }
+                if (mediaType === 'image' && mediaUrl) {
+                    payload = { image: { url: mediaUrl }, caption: message };
+                } else if (mediaType === 'audio' && mediaUrl) {
+                    payload = { audio: { url: mediaUrl }, ptt: true };
+                } else if (mediaType === 'document' && mediaUrl) {
+                    payload = { document: { url: mediaUrl }, fileName: mediaFilename || 'documento.pdf', caption: message };
+                } else {
+                    payload = { text: message };
+                }
 
-        // ✅ NOVO: Limpar conversas ao desconectar
-        await cleanupStoreConversations(sessionId);
+                const result = await session.sock.sendMessage(chatId, payload);
 
-        await clearAuthState(sessionId);
-        activeSessions.delete(String(sessionId));
+                if (result && sessionId !== PLATFORM_BOT_ID) {
+                    forwardMessageToFastAPI(sessionId, result, session.sock).catch(() => {});
+                }
 
-        if (sessionId !== PLATFORM_BOT_ID) {
-            notifyFastAPI({ storeId: sessionId, status: 'disconnected' }).catch(() => {});
-        }
-    } catch (err) {
-        console.error(`[SESSION ${sessionId}] Disconnect error:`, err.message);
-    }
-};
+                return true;
+            } catch (err) {
+                console.error(`[SESSION ${sessionId}] Send error:`, err.message);
+                return false;
+            }
+        };
 
+        /**
+         * Restaura todas as sessões ativas do banco
+         */
+        const restoreActiveSessions = async () => {
+            if (isRestoringComplete) return;
 
-// ✅ SEND MESSAGE (COM ANTI-BAN)
-const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename) => {
-    const session = activeSessions.get(String(sessionId));
-    if (!session?.sock || session.status !== 'open' || !session.sock.user) return false;
+            await ensureAuthDir();
 
-    try {
-        // ✅ ANTI-BAN: Delay entre mensagens
-        await antiSpamDelay();
+            console.log('[RESTORE] 🔄 Starting...');
 
-        const chatId = `${number.replace(/\D/g, '')}@s.whatsapp.net`;
-        let payload;
+            try {
+                const stores = await getStoresToReconnect();
 
-        if (mediaType === 'image' && mediaUrl) {
-            payload = { image: { url: mediaUrl }, caption: message };
-        } else if (mediaType === 'audio' && mediaUrl) {
-            payload = { audio: { url: mediaUrl }, ptt: true };
-        } else if (mediaType === 'document' && mediaUrl) {
-            payload = { document: { url: mediaUrl }, fileName: mediaFilename || 'documento.pdf', caption: message };
-        } else {
-            payload = { text: message };
-        }
+                if (stores.length === 0) {
+                    console.log('[RESTORE] ℹ️ No stores to restore');
+                    isRestoringComplete = true;
+                    return;
+                }
 
-        const result = await session.sock.sendMessage(chatId, payload);
+                console.log(`[RESTORE] Found ${stores.length} stores to restore`);
 
-        if (result && sessionId !== PLATFORM_BOT_ID) {
-            forwardMessageToFastAPI(sessionId, result, session.sock).catch(() => {});
-        }
+                for (const store of stores) {
+                    startSession(String(store.store_id), undefined, 'qr');
 
-        return true;
-    } catch (err) {
-        console.error(`[SESSION ${sessionId}] Send error:`, err.message);
-        return false;
-    }
-};
+                    // ANTI-BAN: Espaçar restaurações
+                    await new Promise(resolve => setTimeout(resolve, SESSION_RESTORE_DELAY));
+                }
 
-// ✅ RESTORE SESSIONS
-const restoreActiveSessions = async () => {
-    if (isRestoringComplete) return;
+                isRestoringComplete = true;
+                console.log('[RESTORE] ✅ Complete');
+            } catch (err) {
+                console.error('[RESTORE] Error:', err.message);
+                isRestoringComplete = true;
+            }
+        };
 
-    await ensureAuthDir();
+        /**
+         * Pausa chat para suporte humano
+         */
+        const pauseChatForHuman = async (storeId, chatId) => {
+            const session = activeSessions.get(String(storeId));
+            if (!session || session.status !== 'open') return false;
 
-    console.log('[RESTORE] 🔄 Starting...');
+            const cacheKey = `state:${chatId}`;
+            let stateResult = await cacheManager.get('conversationState', cacheKey);
+            let state = stateResult?.value || {};
 
-    try {
-        const stores = await getStoresToReconnect();
+            state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
+            await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
 
-        if (stores.length === 0) {
-            console.log('[RESTORE] ℹ️ No stores to restore');
-            isRestoringComplete = true;
-            return;
-        }
+            return true;
+        };
 
-        console.log(`[RESTORE] Found ${stores.length} stores to restore`);
+        /**
+         * Obtém URL da foto de perfil
+         */
+        const getProfilePictureUrl = async (storeId, chatId) => {
+            const session = activeSessions.get(String(storeId));
+            if (!session?.sock || session.status !== 'open') return null;
 
-        for (const store of stores) {
-            startSession(String(store.store_id), undefined, 'qr');
+            try {
+                return await session.sock.profilePictureUrl(chatId, 'image');
+            } catch {
+                return null;
+            }
+        };
 
-            // ✅ ANTI-BAN: Espaçar restaurações
-            await new Promise(resolve => setTimeout(resolve, SESSION_RESTORE_DELAY));
-        }
+        /**
+         * Obtém nome do contato
+         */
+        const getContactName = async (storeId, chatId) => {
+            const session = activeSessions.get(String(storeId));
+            if (!session?.sock || session.status !== 'open') return null;
 
-        isRestoringComplete = true;
-        console.log('[RESTORE] ✅ Complete');
-    } catch (err) {
-        console.error('[RESTORE] Error:', err.message);
-        isRestoringComplete = true;
-    }
-};
+            try {
+                const [result] = await session.sock.onWhatsApp(chatId);
+                return result?.exists ? result.jid.split('@')[0] : null;
+            } catch {
+                return null;
+            }
+        };
 
-// ✅ Funções auxiliares (mantidas)
-const pauseChatForHuman = async (storeId, chatId) => {
-    const session = activeSessions.get(String(storeId));
-    if (!session || session.status !== 'open') return false;
+        /**
+         * Envia mensagem pelo bot da plataforma
+         */
+        const sendPlatformMessage = async (number, message) => {
+            return await sendMessage(PLATFORM_BOT_ID, number, message, null, null, null);
+        };
 
-    const cacheKey = `state:${chatId}`;
-    let stateResult = await cacheManager.get('conversationState', cacheKey);
-    let state = stateResult?.value || {};
+        /**
+         * Obtém socket de uma loja específica
+         */
+        const getSocketForStore = (storeId) => {
+            const session = activeSessions.get(String(storeId));
+            return (session && session.sock && session.status === 'open') ? session.sock : null;
+        };
 
-    state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
-    await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
+        /**
+         * Shutdown graceful de todas as sessões
+         */
+        const shutdown = async () => {
+            console.log('[SHUTDOWN] 🛑 Starting...');
 
-    return true;
-};
+            // Limpar timers de salvamento de credenciais
+            for (const timer of credsSaveTimers.values()) {
+                clearTimeout(timer);
+            }
+            credsSaveTimers.clear();
 
-const getProfilePictureUrl = async (storeId, chatId) => {
-    const session = activeSessions.get(String(storeId));
-    if (!session?.sock || session.status !== 'open') return null;
+            // Limpar mapa de mensagens processadas
+            processedMessages.clear();
 
-    try {
-        return await session.sock.profilePictureUrl(chatId, 'image');
-    } catch {
-        return null;
-    }
-};
+            const promises = [];
+            for (const [storeId, session] of activeSessions.entries()) {
+                if (session.sock && session.status === 'open') {
+                    promises.push(session.sock.end(undefined).catch(() => {}));
+                }
+            }
 
-const getContactName = async (storeId, chatId) => {
-    const session = activeSessions.get(String(storeId));
-    if (!session?.sock || session.status !== 'open') return null;
+            await Promise.all(promises);
+            activeSessions.clear();
 
-    try {
-        const [result] = await session.sock.onWhatsApp(chatId);
-        return result?.exists ? result.jid.split('@')[0] : null;
-    } catch {
-        return null;
-    }
-};
+            console.log('[SHUTDOWN] ✅ Complete');
+        };
 
-const sendPlatformMessage = async (number, message) => {
-    return await sendMessage(PLATFORM_BOT_ID, number, message, null, null, null);
-};
+        // ============================================================
+        // 📤 EXPORTS
+        // ============================================================
 
-const shutdown = async () => {
-    console.log('[SHUTDOWN] 🛑 Starting...');
-
-    const promises = [];
-    for (const [storeId, session] of activeSessions.entries()) {
-        if (session.sock && session.status === 'open') {
-            promises.push(session.sock.end(undefined).catch(() => {}));
-        }
-    }
-
-    await Promise.all(promises);
-    activeSessions.clear();
-
-    console.log('[SHUTDOWN] ✅ Complete');
-};
-
-const getSocketForStore = (storeId) => {
-    const session = activeSessions.get(String(storeId));
-    return (session && session.sock && session.status === 'open') ? session.sock : null;
-};
-
-export default {
-    activeSessions,
-    startSession,
-    disconnectSession,
-    sendMessage,
-    restoreActiveSessions,
-    shutdown,
-    pauseChatForHuman,
-    sendPlatformMessage,
-    getProfilePictureUrl,
-    getContactName,
-    getSocketForStore
-};
+        export default {
+            activeSessions,
+            startSession,
+            disconnectSession,
+            sendMessage,
+            restoreActiveSessions,
+            shutdown,
+            pauseChatForHuman,
+            sendPlatformMessage,
+            getProfilePictureUrl,
+            getContactName,
+            getSocketForStore
+        };

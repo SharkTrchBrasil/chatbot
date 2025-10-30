@@ -1,18 +1,15 @@
-// services/cacheService.js - VERSÃO FINAL CORRIGIDA
+// services/cacheService.js - VERSÃO CORRIGIDA COM MÉTODO DELETE
 import NodeCache from 'node-cache';
 
 class SecureCacheManager {
     constructor() {
         this.cache = new NodeCache({
             stdTTL: 60,
-            maxKeys: 500, // ⬇️ REDUZIDO de 1000
-            checkperiod: 120, // ⬆️ AUMENTADO de 60
+            maxKeys: 500,
+            checkperiod: 120,
             useClones: false,
             deleteOnExpire: true
         });
-
-        // ✅ REMOVIDO: Monitoramento de memória duplicado
-        // O monitoring.js já faz isso
     }
 
     async get(namespace, key) {
@@ -33,9 +30,8 @@ class SecureCacheManager {
 
     async set(namespace, key, value, ttl = 60) {
         try {
-            // ✅ VALIDAÇÃO DE TAMANHO RIGOROSA
             const size = Buffer.byteLength(JSON.stringify(value), 'utf8');
-            if (size > 512 * 1024) { // ⬇️ REDUZIDO: 512KB max (era 1MB)
+            if (size > 512 * 1024) {
                 console.warn(`[CACHE] Object too large: ${(size / 1024).toFixed(2)}KB`);
                 return false;
             }
@@ -48,7 +44,49 @@ class SecureCacheManager {
         }
     }
 
-    // ✅ NOVO: Método flush público
+    // ✅ NOVO: Método delete
+    async delete(namespace, key) {
+        try {
+            const fullKey = `${namespace}:${key}`;
+            const deleted = this.cache.del(fullKey);
+
+            if (deleted > 0) {
+                console.log(`[CACHE] ✅ Deleted key: ${fullKey}`);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error('[CACHE] Delete error:', error.message);
+            return false;
+        }
+    }
+
+    // ✅ NOVO: Deletar múltiplas chaves por padrão
+    async deletePattern(namespace, pattern = '*') {
+        try {
+            const searchKey = `${namespace}:${pattern}`;
+            const allKeys = this.cache.keys();
+            const matchedKeys = allKeys.filter(key => {
+                if (pattern === '*') {
+                    return key.startsWith(`${namespace}:`);
+                }
+                // Suporte básico para wildcards
+                const regex = new RegExp(searchKey.replace(/\*/g, '.*'));
+                return regex.test(key);
+            });
+
+            if (matchedKeys.length > 0) {
+                this.cache.del(matchedKeys);
+                console.log(`[CACHE] ✅ Deleted ${matchedKeys.length} keys matching ${searchKey}`);
+                return matchedKeys.length;
+            }
+            return 0;
+        } catch (error) {
+            console.error('[CACHE] Delete pattern error:', error.message);
+            return 0;
+        }
+    }
+
     flush() {
         const count = this.cache.keys().length;
         this.cache.flushAll();
