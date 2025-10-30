@@ -129,7 +129,9 @@ const createLogger = (sessionId) => {
     };
 };
 
-// ✅ AUTH STATE
+// ✅ SUBSTITUIR apenas a função createAuthStateFromDB em whatsappService.js
+
+// ✅ AUTH STATE - VERSÃO CORRIGIDA
 const createAuthStateFromDB = (sessionId) => {
     const authState = {
         state: {
@@ -166,7 +168,7 @@ const createAuthStateFromDB = (sessionId) => {
     return authState;
 };
 
-// ✅ START SESSION OTIMIZADO
+// ✅ START SESSION - VERSÃO CORRIGIDA
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -198,6 +200,8 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         } else if (savedCreds) {
             console.warn(`[SESSION ${sessionId}] Invalid creds. Starting fresh.`);
             await authDB.clearAll(sessionId);
+        } else {
+            console.log(`[SESSION ${sessionId}] No creds found. Starting fresh connection.`);
         }
 
         // ✅ IMPORTANTE: Usar versão mais recente do Baileys
@@ -230,12 +234,11 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             },
 
             // ✅ CRÍTICO: Limitar histórico de mensagens
-            msgRetryCounterCache: undefined, // Desabilita cache de retry
-            cachedGroupMetadata: undefined, // Desabilita cache de grupos
+            msgRetryCounterCache: undefined,
+            cachedGroupMetadata: undefined,
 
             // ✅ PERFORMANCE: Reduzir processamento
             patchMessageBeforeSending: (msg) => {
-                // Remove campos desnecessários antes de enviar
                 delete msg.messageTimestamp;
                 delete msg.status;
                 return msg;
@@ -244,10 +247,12 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         sessionEntry.sock = waSocket;
 
-        // ✅ EVENTOS
+        // ✅ EVENTOS - Salvar credenciais quando atualizarem
         waSocket.ev.on('creds.update', async (update) => {
+            console.log(`[SESSION ${sessionId}] 💾 Updating credentials...`);
             Object.assign(authState.state.creds || {}, update);
             await authState.saveCreds();
+            console.log(`[SESSION ${sessionId}] ✅ Credentials saved`);
         });
 
         waSocket.ev.on('connection.update', async (update) => {
@@ -255,6 +260,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
             if (connection === 'connecting') {
                 sessionEntry.status = 'connecting';
+                console.log(`[SESSION ${sessionId}] 🔄 Connecting...`);
             }
 
             if (connection === 'open') {
@@ -269,25 +275,29 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                         whatsappName: waSocket.user?.name,
                         whatsappId: waSocket.user?.id,
                         isActive: true
-                    }).catch(() => {});
+                    }).catch((err) => {
+                        console.error(`[SESSION ${sessionId}] Failed to notify FastAPI:`, err.message);
+                    });
                 }
             }
 
             if (qr) {
-                console.log(`[SESSION ${sessionId}] 🔲 QR generated`);
+                console.log(`[SESSION ${sessionId}] 🔲 QR Code generated`);
                 if (sessionId !== PLATFORM_BOT_ID) {
                     notifyFastAPI({
                         storeId: sessionId,
                         status: 'awaiting_qr',
                         qrCode: qr
-                    }).catch(() => {});
+                    }).catch((err) => {
+                        console.error(`[SESSION ${sessionId}] Failed to send QR:`, err.message);
+                    });
                 }
             }
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 sessionEntry.status = 'disconnected';
-                console.log(`[SESSION ${sessionId}] ❌ Closed (${statusCode})`);
+                console.log(`[SESSION ${sessionId}] ❌ Closed (Status: ${statusCode})`);
                 activeSessions.delete(String(sessionId));
 
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut &&
@@ -295,16 +305,23 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                                        statusCode !== 403;
 
                 if (statusCode === DisconnectReason.loggedOut) {
+                    console.log(`[SESSION ${sessionId}] User logged out. Clearing credentials.`);
                     await authDB.clearAll(sessionId);
                     if (sessionId !== PLATFORM_BOT_ID) {
                         notifyFastAPI({ storeId: sessionId, status: 'disconnected' }).catch(() => {});
                     }
                 } else if ([401, 403, 405, 440].includes(statusCode)) {
+                    console.log(`[SESSION ${sessionId}] Auth error. Clearing credentials.`);
                     await authDB.clearAll(sessionId);
                     if (sessionId !== PLATFORM_BOT_ID) {
-                        notifyFastAPI({ storeId: sessionId, status: 'disconnected', error: 'Auth failed' }).catch(() => {});
+                        notifyFastAPI({
+                            storeId: sessionId,
+                            status: 'disconnected',
+                            error: 'Auth failed'
+                        }).catch(() => {});
                     }
                 } else if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                    console.log(`[SESSION ${sessionId}] Retrying connection (attempt ${attempt}/${MAX_RESTORE_ATTEMPTS})...`);
                     setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), 10000);
                 }
             }
@@ -358,10 +375,11 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         // PAIRING CODE
         if (method === 'pairing' && phoneNumber) {
             try {
+                console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
                 await new Promise(resolve => setTimeout(resolve, 2000));
                 const code = await waSocket.requestPairingCode(phoneNumber);
                 const formatted = code.match(/.{1,4}/g).join('-');
-                console.log(`[SESSION ${sessionId}] ✅ Pairing: ${formatted}`);
+                console.log(`[SESSION ${sessionId}] ✅ Pairing Code: ${formatted}`);
 
                 if (sessionId !== PLATFORM_BOT_ID) {
                     notifyFastAPI({
@@ -371,7 +389,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                     }).catch(() => {});
                 }
             } catch (err) {
-                console.error(`[SESSION ${sessionId}] Pairing failed:`, err.message);
+                console.error(`[SESSION ${sessionId}] ❌ Pairing failed:`, err.message);
                 sessionEntry.status = 'error';
                 waSocket.end();
                 await authDB.clearAll(sessionId);
@@ -381,6 +399,8 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
     } catch (error) {
         console.error(`[SESSION ${sessionId}] ❌ ERROR:`, error.message);
+        console.error(error.stack);
+
         const entry = activeSessions.get(String(sessionId));
         if (entry) {
             entry.status = 'error';
@@ -389,10 +409,22 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
             const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 30000);
+            console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay}ms...`);
             setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), delay);
         }
     }
 };
+
+
+
+
+
+
+
+
+
+
+
 
 // ✅ OUTRAS FUNÇÕES (mantidas)
 const disconnectSession = async (sessionId) => {
