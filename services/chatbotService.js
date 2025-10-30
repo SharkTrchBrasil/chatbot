@@ -246,25 +246,41 @@ export const updateConnectionStatus = async (storeId, status, qrCode = null, con
     }
 };
 
+// services/chatbotService.js - FUNÇÃO CORRIGIDA
+
 // ✅ EXPORTADO (Movido da classe)
 export const updateConversationMetadata = async (storeId, message) => {
     try {
         const chatId = message.key.remoteJid;
         const messagePreview = (message.message?.conversation || '...').substring(0, 100);
+        const now = new Date();
 
-        // ✅ CORREÇÃO: Usando a função importada
+        // ✅ CORREÇÃO: Incluir created_at E updated_at na query
         await executeQueryMany(
             `INSERT INTO chatbot_conversation_metadata
-             (chat_id, store_id, last_message_preview, last_message_timestamp, unread_count)
-             VALUES ($1, $2, $3, $4, 1)
+             (chat_id, store_id, last_message_preview, last_message_timestamp, unread_count, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 1, $5, $6)
              ON CONFLICT (chat_id, store_id)
              DO UPDATE SET
                  last_message_preview = $3,
                  last_message_timestamp = $4,
-                 unread_count = chatbot_conversation_metadata.unread_count + 1`,
-            [chatId, storeId, messagePreview, new Date()]
+                 unread_count = chatbot_conversation_metadata.unread_count + 1,
+                 updated_at = $6
+             WHERE chatbot_conversation_metadata.chat_id = $1
+             AND chatbot_conversation_metadata.store_id = $2`,
+            [
+                chatId,
+                storeId,
+                messagePreview,
+                now,
+                now,  // ✅ created_at
+                now   // ✅ updated_at
+            ]
         );
+
+        console.log(`[METADATA] ✅ Conversation metadata updated for ${chatId}`);
     } catch (error) {
-        console.error('[DB] ❌ Erro ao atualizar metadata da conversação:', error);
+        console.error('[DB] ❌ Erro ao atualizar metadata da conversa:', error.message);
+        // ✅ NÃO lançar erro - deixar continuar processando
     }
 };
