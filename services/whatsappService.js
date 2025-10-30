@@ -68,7 +68,7 @@ const createLogger = (sessionId) => ({
     child: () => createLogger(sessionId)
 });
 
-// âœ… BANCO DE DADOS: Salvar credenciais
+
 const saveCredsToDatabase = async (sessionId, creds) => {
     const client = await pool.connect();
     try {
@@ -94,7 +94,7 @@ const saveCredsToDatabase = async (sessionId, creds) => {
 };
 
 
-// ✅ BANCO DE DADOS: Carregar credenciais
+
 const loadCredsFromDatabase = async (sessionId) => {
     const client = await pool.connect();
     try {
@@ -117,7 +117,7 @@ const loadCredsFromDatabase = async (sessionId) => {
     }
 };
 
-// ✅ BANCO DE DADOS: Limpar credenciais
+
 const clearCredsFromDatabase = async (sessionId) => {
     const client = await pool.connect();
     try {
@@ -133,7 +133,46 @@ const clearCredsFromDatabase = async (sessionId) => {
     }
 };
 
-// ✅ HÍBRIDO: Auth state (filesystem + sync para DB)
+
+const cleanupStoreConversations = async (storeId) => {
+    const client = await pool.connect();
+    try {
+        console.log(`[CLEANUP] 🧹 Starting cleanup for store ${storeId}...`);
+
+        // ✅ 1. Deletar todas as mensagens do chatbot
+        const messagesResult = await client.query(
+            'DELETE FROM chatbot_messages WHERE store_id = $1',
+            [storeId]
+        );
+        console.log(`[CLEANUP] ✅ Deleted ${messagesResult.rowCount} messages`);
+
+        // ✅ 2. Deletar todos os metadados de conversa
+        const metadataResult = await client.query(
+            'DELETE FROM chatbot_conversation_metadata WHERE store_id = $1',
+            [storeId]
+        );
+        console.log(`[CLEANUP] ✅ Deleted ${metadataResult.rowCount} conversation metadata entries`);
+
+        // ✅ 3. Limpar cache de conversas (se estiver usando Redis/cache)
+        try {
+            // Exemplo: se você está usando cacheManager
+            const cacheKey = `store:${storeId}:conversations`;
+            await cacheManager.delete('conversationState', cacheKey);
+            console.log(`[CLEANUP] ✅ Cleared conversation cache`);
+        } catch (err) {
+            console.warn(`[CLEANUP] ⚠️ Cache clear warning:`, err.message);
+        }
+
+        console.log(`[CLEANUP] ✅ Cleanup complete for store ${storeId}`);
+        return true;
+
+    } catch (err) {
+        console.error(`[CLEANUP] ❌ Error cleaning store ${storeId}:`, err.message);
+        return false;
+    } finally {
+        client.release();
+    }
+};
 const getAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
@@ -170,7 +209,6 @@ const getAuthState = async (sessionId) => {
     }
 };
 
-// ✅ Limpar auth completo (filesystem + DB)
 const clearAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
@@ -183,7 +221,7 @@ const clearAuthState = async (sessionId) => {
     }
 };
 
-// ✅ SUBSTITUA A FUNÇÃO startSession COMPLETAMENTE
+
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -367,68 +405,86 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 }
             }
 
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          if (connection === 'close') {
+              const statusCode = lastDisconnect?.error?.output?.statusCode;
+              const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-                sessionEntry.status = 'disconnected';
+              sessionEntry.status = 'disconnected';
 
-                // ✅ Evitar notificar desconexão se nunca notificou conexão
-                const shouldNotifyDisconnect = sessionEntry.lastNotifiedStatus === 'open';
+              const shouldNotifyDisconnect = sessionEntry.lastNotifiedStatus === 'open';
 
-                // ✅ Logs informativos
-                if (statusCode === 515) {
-                    console.log(`[SESSION ${sessionId}] ⚠️ Rate limit (515) - waiting before retry`);
-                } else if (statusCode === 401) {
-                    console.log(`[SESSION ${sessionId}] ❌ Unauthorized (401) - clearing auth`);
-                } else {
-                    console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode || 'unknown'})`);
-                }
+              // ✅ Logs informativos
+              if (statusCode === 515) {
+                  console.log(`[SESSION ${sessionId}] ⚠️ Rate limit (515) - waiting before retry`);
+              } else if (statusCode === 401) {
+                  console.log(`[SESSION ${sessionId}] ❌ Unauthorized (401) - clearing auth`);
+                  // ✅ NOVO: Limpar conversas em caso de 401
+                  await cleanupStoreConversations(sessionId);
+              } else if (statusCode === 440) {
+                  console.log(`[SESSION ${sessionId}] ❌ Device logout (440) - clearing everything`);
+                  // ✅ NOVO: Limpar conversas em caso de logout do dispositivo
+                  await cleanupStoreConversations(sessionId);
+              } else {
+                  console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode || 'unknown'})`);
+              }
 
-                // ✅ NÃO deletar a sessão imediatamente - apenas marcar como disconnected
-                // activeSessions.delete(String(sessionId)); // ⬅️ REMOVIDO
+              // ✅ Limpar auth em casos críticos
+              if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
+                  await clearAuthState(sessionId);
+                  // ✅ NOVO: Também limpar conversas nestes casos
+                  await cleanupStoreConversations(sessionId);
+              }
 
-                // ✅ Limpar auth em casos críticos
-                if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
-                    await clearAuthState(sessionId);
-                }
+              // ✅ ANTI-BAN: Retry com backoff exponencial
+              if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                  let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
 
-                // ✅ ANTI-BAN: Retry com backoff exponencial
-                if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
-                    let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
+                  if (statusCode === 515) {
+                      delay = Math.max(delay, 30000);
+                  }
 
-                    if (statusCode === 515) {
-                        delay = Math.max(delay, 30000);
-                    }
+                  delay = Math.min(delay, 120000);
 
-                    delay = Math.min(delay, 120000);
+                  console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s...`);
 
-                    console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s...`);
+                  activeSessions.delete(String(sessionId));
 
-                    // ✅ Limpar a sessão antes de tentar nova conexão
-                    activeSessions.delete(String(sessionId));
+                  setTimeout(() => {
+                      startSession(sessionId, phoneNumber, method, attempt + 1);
+                  }, delay);
+              } else {
+                  activeSessions.delete(String(sessionId));
+              }
 
-                    setTimeout(() => {
-                        startSession(sessionId, phoneNumber, method, attempt + 1);
-                    }, delay);
-                } else {
-                    // ✅ Se não vai reconectar, limpar agora
-                    activeSessions.delete(String(sessionId));
-                }
+              // ✅ Apenas notificar se realmente estava conectado
+              if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect && !sessionEntry.isNotifying) {
+                  sessionEntry.isNotifying = true;
 
-                // ✅ Apenas notificar se realmente estava conectado
-                if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect && !sessionEntry.isNotifying) {
-                    sessionEntry.isNotifying = true;
+                  notifyFastAPI({
+                      storeId: sessionId,
+                      status: 'disconnected',
+                      reason: statusCode ? `Error ${statusCode}` : 'Unknown'
+                  }).catch(() => {}).finally(() => {
+                      sessionEntry.isNotifying = false;
+                  });
+              }
+          }
 
-                    notifyFastAPI({
-                        storeId: sessionId,
-                        status: 'disconnected',
-                        reason: statusCode ? `Error ${statusCode}` : 'Unknown'
-                    }).catch(() => {}).finally(() => {
-                        sessionEntry.isNotifying = false;
-                    });
-                }
-            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
         });
 
         // ✅ EVENT: Mensagens
@@ -516,13 +572,17 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     }
 };
 
-// ✅ DISCONNECT
+// ✅ ATUALIZE A FUNÇÃO disconnectSession
 const disconnectSession = async (sessionId) => {
     const session = activeSessions.get(String(sessionId));
     try {
         if (session?.sock) {
             session.sock.logout();
         }
+
+        // ✅ NOVO: Limpar conversas ao desconectar
+        await cleanupStoreConversations(sessionId);
+
         await clearAuthState(sessionId);
         activeSessions.delete(String(sessionId));
 
@@ -533,6 +593,7 @@ const disconnectSession = async (sessionId) => {
         console.error(`[SESSION ${sessionId}] Disconnect error:`, err.message);
     }
 };
+
 
 // ✅ SEND MESSAGE (COM ANTI-BAN)
 const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename) => {
