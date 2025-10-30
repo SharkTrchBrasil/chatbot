@@ -29,6 +29,7 @@ const AUTH_DIR = path.join(__dirname, '..', 'auth_sessions');
 // ✅ ANTI-BAN: Delay entre operações
 const OPERATION_DELAY = 2000;
 const antiSpamDelay = () => new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
+const credsSaveTimers = new Map(); // ⬅️ NOVO: Rastrear por sessão
 
 // ✅ Garantir diretório
 const ensureAuthDir = async () => {
@@ -175,7 +176,7 @@ const clearAuthState = async (sessionId) => {
     }
 };
 
-// ✅ START SESSION - ANTI-BAN + HÍBRIDO
+// ✅ SUBSTITUA A FUNÇÃO startSession COMPLETAMENTE
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -200,8 +201,12 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             isActive: true,
             createdAt: Date.now(),
             lastError: null,
-            messageCount: 0
+            messageCount: 0,
+            lastNotifiedStatus: null,
+            connectionStabilizedAt: null,
+            isNotifying: false // ⬅️ NOVO: Flag para evitar notificações simultâneas
         };
+
         activeSessions.set(String(sessionId), sessionEntry);
 
         const { state, saveCreds } = await getAuthState(sessionId);
@@ -221,7 +226,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             auth: state,
             version,
             printQRInTerminal: false,
-            browser: ['PDVix', 'Chrome', '120.0.0'], // ⬇️ Nome genérico
+            browser: ['PDVix', 'Chrome', '120.0.0'],
             logger: createLogger(sessionId),
 
             // ✅ ANTI-BAN CRÍTICO
@@ -237,7 +242,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             // ✅ Timeouts aumentados
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 45000, // ⬆️ Menos agressivo
+            keepAliveIntervalMs: 45000,
             qrTimeout: 60000,
 
             // ✅ Filtros
@@ -261,10 +266,29 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         sessionEntry.sock = waSocket;
 
-        // ✅ EVENT: Salvar credenciais (filesystem + DB)
-        waSocket.ev.on('creds.update', saveCreds);
+        // ✅ EVENT: Salvar credenciais (COM THROTTLE CORRETO)
+        waSocket.ev.on('creds.update', async () => {
+            const sessionIdStr = String(sessionId);
 
-        // ✅ EVENT: Connection
+            // Limpar timer anterior se existir
+            if (credsSaveTimers.has(sessionIdStr)) {
+                clearTimeout(credsSaveTimers.get(sessionIdStr));
+            }
+
+            // Agendar save para 1 segundo depois
+            const timer = setTimeout(async () => {
+                try {
+                    await saveCreds();
+                    credsSaveTimers.delete(sessionIdStr);
+                } catch (err) {
+                    console.error(`[SESSION ${sessionId}] Creds save error:`, err.message);
+                }
+            }, 1000);
+
+            credsSaveTimers.set(sessionIdStr, timer);
+        });
+
+        // ✅ EVENT: Connection (CORRIGIDO)
         waSocket.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
@@ -274,8 +298,22 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             }
 
             if (connection === 'open') {
+                // ✅ VALIDAÇÃO: Aguardar user ID
+                if (!waSocket.user?.id) {
+                    console.warn(`[SESSION ${sessionId}] ⚠️ Connection open, but no user ID yet`);
+                    return;
+                }
+
+                // ✅ Evitar notificações duplicadas
+                if (sessionEntry.lastNotifiedStatus === 'open') {
+                    console.log(`[SESSION ${sessionId}] ℹ️ Already notified as connected`);
+                    return;
+                }
+
                 sessionEntry.status = 'open';
                 sessionEntry.lastError = null;
+                sessionEntry.lastNotifiedStatus = 'open';
+                sessionEntry.connectionStabilizedAt = Date.now();
 
                 const userName = waSocket.user?.name || 'Unknown';
                 const userId = waSocket.user?.id || 'Unknown';
@@ -285,7 +323,9 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 // ✅ ANTI-BAN: Delay antes de notificar
                 await antiSpamDelay();
 
-                if (sessionId !== PLATFORM_BOT_ID) {
+                if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
+                    sessionEntry.isNotifying = true;
+
                     notifyFastAPI({
                         storeId: sessionId,
                         status: 'connected',
@@ -294,19 +334,29 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                         isActive: true
                     }).catch((err) => {
                         console.error(`[SESSION ${sessionId}] Notify error:`, err.message);
+                    }).finally(() => {
+                        sessionEntry.isNotifying = false;
                     });
                 }
             }
 
             if (qr) {
-                console.log(`[SESSION ${sessionId}] 📲 QR Code generated`);
+                // ✅ Evitar notificar QR múltiplas vezes
+                if (sessionEntry.lastNotifiedStatus !== 'awaiting_qr') {
+                    console.log(`[SESSION ${sessionId}] 📲 QR Code generated`);
+                    sessionEntry.lastNotifiedStatus = 'awaiting_qr';
 
-                if (sessionId !== PLATFORM_BOT_ID) {
-                    notifyFastAPI({
-                        storeId: sessionId,
-                        status: 'awaiting_qr',
-                        qrCode: qr
-                    }).catch(() => {});
+                    if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
+                        sessionEntry.isNotifying = true;
+
+                        notifyFastAPI({
+                            storeId: sessionId,
+                            status: 'awaiting_qr',
+                            qrCode: qr
+                        }).catch(() => {}).finally(() => {
+                            sessionEntry.isNotifying = false;
+                        });
+                    }
                 }
             }
 
@@ -316,7 +366,10 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
                 sessionEntry.status = 'disconnected';
 
-                // ✅ Logs informativos baseados no código
+                // ✅ Evitar notificar desconexão se nunca notificou conexão
+                const shouldNotifyDisconnect = sessionEntry.lastNotifiedStatus === 'open';
+
+                // ✅ Logs informativos
                 if (statusCode === 515) {
                     console.log(`[SESSION ${sessionId}] ⚠️ Rate limit (515) - waiting before retry`);
                 } else if (statusCode === 401) {
@@ -325,7 +378,8 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                     console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode || 'unknown'})`);
                 }
 
-                activeSessions.delete(String(sessionId));
+                // ✅ NÃO deletar a sessão imediatamente - apenas marcar como disconnected
+                // activeSessions.delete(String(sessionId)); // ⬅️ REMOVIDO
 
                 // ✅ Limpar auth em casos críticos
                 if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
@@ -336,31 +390,41 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
                     let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
 
-                    // ✅ ANTI-BAN: Aumentar delay em caso de 515 (rate limit)
                     if (statusCode === 515) {
-                        delay = Math.max(delay, 30000); // Mínimo 30s
+                        delay = Math.max(delay, 30000);
                     }
 
-                    delay = Math.min(delay, 120000); // Máximo 2min
+                    delay = Math.min(delay, 120000);
 
                     console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s...`);
+
+                    // ✅ Limpar a sessão antes de tentar nova conexão
+                    activeSessions.delete(String(sessionId));
 
                     setTimeout(() => {
                         startSession(sessionId, phoneNumber, method, attempt + 1);
                     }, delay);
+                } else {
+                    // ✅ Se não vai reconectar, limpar agora
+                    activeSessions.delete(String(sessionId));
                 }
 
-                if (sessionId !== PLATFORM_BOT_ID) {
+                // ✅ Apenas notificar se realmente estava conectado
+                if (sessionId !== PLATFORM_BOT_ID && shouldNotifyDisconnect && !sessionEntry.isNotifying) {
+                    sessionEntry.isNotifying = true;
+
                     notifyFastAPI({
                         storeId: sessionId,
                         status: 'disconnected',
                         reason: statusCode ? `Error ${statusCode}` : 'Unknown'
-                    }).catch(() => {});
+                    }).catch(() => {}).finally(() => {
+                        sessionEntry.isNotifying = false;
+                    });
                 }
             }
         });
 
-        // ✅ EVENT: Mensagens (COM CORREÇÃO DO CRASH)
+        // ✅ EVENT: Mensagens
         waSocket.ev.on('messages.upsert', async (m) => {
             for (const msg of m.messages || []) {
                 if (!msg?.key?.remoteJid || !msg.message || msg.key.fromMe) continue;
@@ -368,7 +432,6 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 const chatId = msg.key.remoteJid;
                 if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) continue;
 
-                // ✅ ANTI-BAN: Limitar taxa de processamento
                 sessionEntry.messageCount++;
                 if (sessionEntry.messageCount > 50) {
                     await antiSpamDelay();
@@ -379,10 +442,8 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                     updateConversationMetadata(sessionId, msg).catch(() => {});
 
                     const cacheKey = `state:${chatId}`;
-
-                    // ✅ CORREÇÃO DO CRASH: Inicializar state se null
                     let stateResult = await cacheManager.get('conversationState', cacheKey);
-                    let state = stateResult?.value || {}; // ⬅️ FIX: Default para {}
+                    let state = stateResult?.value || {};
 
                     if (!state.humanSupportUntil || new Date() >= new Date(state.humanSupportUntil)) {
                         await processMessage(msg, sessionId, waSocket, state).catch(err => {
@@ -393,7 +454,6 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                     }
                 }
 
-                // ✅ Encaminhar para FastAPI (não bloquear)
                 forwardMessageToFastAPI(sessionId, msg, waSocket).catch(() => {});
             }
         });
@@ -402,7 +462,6 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         if (method === 'pairing' && phoneNumber) {
             try {
                 console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
-
                 await antiSpamDelay();
 
                 const code = await waSocket.requestPairingCode(phoneNumber);
@@ -410,12 +469,16 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
                 console.log(`[SESSION ${sessionId}] ✅ Pairing Code: ${formatted}`);
 
-                if (sessionId !== PLATFORM_BOT_ID) {
+                if (sessionId !== PLATFORM_BOT_ID && !sessionEntry.isNotifying) {
+                    sessionEntry.isNotifying = true;
+
                     notifyFastAPI({
                         storeId: sessionId,
                         status: 'awaiting_pairing_code',
                         pairingCode: code
-                    }).catch(() => {});
+                    }).catch(() => {}).finally(() => {
+                        sessionEntry.isNotifying = false;
+                    });
                 }
             } catch (err) {
                 console.error(`[SESSION ${sessionId}] Pairing error:`, err.message);
