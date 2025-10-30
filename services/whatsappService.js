@@ -118,11 +118,30 @@ const createLogger = (sessionId) => {
     };
 };
 
-// ✅ 6.7.18: AUTH STATE SIMPLIFICADO
+// ✅ CORRIGIDO: Inicializar creds com estrutura válida
+const createDefaultCreds = () => ({
+    me: undefined,
+    noiseKey: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
+    signedIdentityKey: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
+    signedPreKey: {
+        keyPair: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
+        signature: Buffer.alloc(64),
+        keyId: 1
+    },
+    registrationId: Math.floor(Math.random() * (2 ** 31 - 1)),
+    advSecretKey: Buffer.alloc(32).toString('base64'),
+    processedRightContextVersion: 0,
+    firstUnuploadedPreKeyId: 1,
+    nextPreKeyId: 1,
+    oneTimeKeysCount: 0,
+    platform: 'android'
+});
+
+// ✅ 6.7.18: AUTH STATE COM INICIALIZAÇÃO CORRETA
 const createAuthStateFromDB = (sessionId) => {
     const authState = {
         state: {
-            creds: undefined, // ✅ 6.7.18 inicializa automaticamente
+            creds: createDefaultCreds(), // ✅ CORRIGIDO: Inicializar com estrutura válida
             keys: {
                 get: async (type, ids) => {
                     const data = {};
@@ -187,18 +206,23 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         } else if (savedCreds) {
             console.warn(`[SESSION ${sessionId}] Creds inválidas. Starting fresh.`);
             await authDB.clearAll(sessionId);
+            authState.state.creds = createDefaultCreds(); // ✅ Reinicializar
         } else {
             console.log(`[SESSION ${sessionId}] No creds found. Starting fresh connection.`);
+            authState.state.creds = createDefaultCreds(); // ✅ Garantir inicialização
         }
 
         const { version } = await fetchLatestBaileysVersion();
 
-        // ✅ DEBUG: Verificar se makeWASocket é uma função
-        if (typeof makeWASocket !== 'function') {
-            throw new Error(`makeWASocket is not a function! Type: ${typeof makeWASocket}`);
+        // ✅ DEBUG: Verificar creds
+        if (!authState.state.creds) {
+            throw new Error(`[SESSION ${sessionId}] creds is undefined!`);
+        }
+        if (!authState.state.creds.noiseKey) {
+            throw new Error(`[SESSION ${sessionId}] creds.noiseKey is undefined!`);
         }
 
-        console.log(`[SESSION ${sessionId}] ✅ makeWASocket is ready`);
+        console.log(`[SESSION ${sessionId}] ✅ Auth state initialized correctly`);
 
         // ✅ CRÍTICO: Configurações para 6.7.18 (evita memory leak)
         const waSocket = makeWASocket({
