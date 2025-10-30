@@ -1,11 +1,6 @@
-// services/whatsappService.js - CORRIGIDO PARA ES MODULES
+// services/whatsappService.js - CORRIGIDO PARA 6.7.18 (428 ERROR FIX)
 
-// ✅ CORREÇÃO CRÍTICA: Usar import dinâmico ou syntax correto
-import { makeWASocket as makeWASocketFn, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
-
-// ✅ RENOMEAR para evitar conflitos
-const makeWASocket = makeWASocketFn;
-
+import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import { getStoresToReconnect, updateConversationMetadata } from './chatbotService.js';
 import { notifyFastAPI } from '../utils/notifications.js';
@@ -13,168 +8,74 @@ import { processMessage } from '../controllers/chatbotController.js';
 import { forwardMessageToFastAPI } from '../utils/forwarder.js';
 import { cacheManager } from './cacheService.js';
 import pool from '../config/database.js';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const activeSessions = new Map();
 const PLATFORM_BOT_ID = 'platform';
 export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000;
 const MAX_RESTORE_ATTEMPTS = 3;
-const SESSION_RESTORE_DELAY = 3000;
+const SESSION_RESTORE_DELAY = 5000;
 
 let isRestoringComplete = false;
 
-// ✅ 6.7.18: Validação simplificada
-const isValidCredentials = (creds) => {
-    if (!creds || typeof creds !== 'object') return false;
-    return !!creds.me?.id;
-};
+// ✅ CRÍTICO: Diretório para auth_info (6.7.18 requer filesystem)
+const AUTH_DIR = path.join(__dirname, '..', 'auth_sessions');
 
-// ✅ 6.7.18: Sanitização mínima (reduz memory leak)
-const sanitizeCredentials = (creds) => {
-    if (!creds) return null;
-    return creds;
-};
-
-// ✅ AUTH DB - Versão para 6.7.18
-const authDB = {
-    read: async (sessionId, key) => {
-        const client = await pool.connect();
-        try {
-            const query = 'SELECT cred_value FROM chatbot_auth_credentials WHERE session_id = $1 AND cred_id = $2';
-            const { rows } = await client.query(query, [sessionId, key]);
-
-            if (rows.length === 0) return null;
-
-            const data = rows[0].cred_value;
-
-            // ✅ Validar apenas creds completas
-            if (key === 'creds') {
-                if (!isValidCredentials(data)) {
-                    console.warn(`[AUTH DB] Invalid creds for ${sessionId}. Clearing.`);
-                    await this.clearAll(sessionId);
-                    return null;
-                }
-            }
-
-            return data;
-        } catch (err) {
-            console.error(`[AUTH DB] Read error for ${sessionId}:`, err.message);
-            return null;
-        } finally {
-            client.release();
-        }
-    },
-
-    write: async (sessionId, key, value) => {
-        const client = await pool.connect();
-        try {
-            const finalValue = key === 'creds' ? sanitizeCredentials(value) : value;
-            if (!finalValue && key === 'creds') return false;
-
-            const query = `
-                INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (session_id, cred_id)
-                DO UPDATE SET cred_value = EXCLUDED.cred_value, updated_at = CURRENT_TIMESTAMP
-            `;
-
-            await client.query(query, [sessionId, key, finalValue]);
-            return true;
-        } catch (err) {
-            console.error(`[AUTH DB] Write error for ${sessionId}:`, err.message);
-            return false;
-        } finally {
-            client.release();
-        }
-    },
-
-    clearAll: async (sessionId) => {
-        const client = await pool.connect();
-        try {
-            await client.query('DELETE FROM chatbot_auth_credentials WHERE session_id = $1', [sessionId]);
-            return true;
-        } catch (err) {
-            console.error(`[AUTH DB] Clear error for ${sessionId}:`, err.message);
-            return false;
-        } finally {
-            client.release();
-        }
+// ✅ Garantir que o diretório existe
+const ensureAuthDir = async () => {
+    try {
+        await fs.mkdir(AUTH_DIR, { recursive: true });
+    } catch (err) {
+        console.error('[AUTH] Failed to create auth dir:', err.message);
     }
 };
 
-// ✅ LOGGER
-const createLogger = (sessionId) => {
-    return {
-        level: 'silent',
-        trace: () => {},
-        debug: () => {},
-        info: (msg) => {
-            if (process.env.NODE_ENV === 'development') {
-                console.log(`[SESSION ${sessionId}][INFO]`, msg);
-            }
-        },
-        warn: (msg) => console.warn(`[SESSION ${sessionId}][WARN]`, msg),
-        error: (msg) => console.error(`[SESSION ${sessionId}][ERROR]`, msg),
-        child: () => createLogger(sessionId)
-    };
-};
-
-// ✅ CORRIGIDO: Inicializar creds com estrutura válida
-const createDefaultCreds = () => ({
-    me: undefined,
-    noiseKey: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
-    signedIdentityKey: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
-    signedPreKey: {
-        keyPair: { private: Buffer.alloc(32), public: Buffer.alloc(33) },
-        signature: Buffer.alloc(64),
-        keyId: 1
+// ✅ Logger otimizado
+const createLogger = (sessionId) => ({
+    level: 'silent',
+    trace: () => {},
+    debug: () => {},
+    info: (msg) => {
+        if (process.env.NODE_ENV === 'development') {
+            console.log(`[SESSION ${sessionId}][INFO]`, msg);
+        }
     },
-    registrationId: Math.floor(Math.random() * (2 ** 31 - 1)),
-    advSecretKey: Buffer.alloc(32).toString('base64'),
-    processedRightContextVersion: 0,
-    firstUnuploadedPreKeyId: 1,
-    nextPreKeyId: 1,
-    oneTimeKeysCount: 0,
-    platform: 'android'
+    warn: (msg) => console.warn(`[SESSION ${sessionId}][WARN]`, msg),
+    error: (msg) => console.error(`[SESSION ${sessionId}][ERROR]`, msg),
+    child: () => createLogger(sessionId)
 });
 
-// ✅ 6.7.18: AUTH STATE COM INICIALIZAÇÃO CORRETA
-const createAuthStateFromDB = (sessionId) => {
-    const authState = {
-        state: {
-            creds: createDefaultCreds(), // ✅ CORRIGIDO: Inicializar com estrutura válida
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    for (const id of ids) {
-                        const key = `${type}-${id}`;
-                        const value = await authDB.read(sessionId, key);
-                        if (value) data[id] = value;
-                    }
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            tasks.push(authDB.write(sessionId, key, value));
-                        }
-                    }
-                    await Promise.all(tasks);
-                }
-            }
-        },
-        saveCreds: async () => {
-            if (authState.state.creds) {
-                await authDB.write(sessionId, 'creds', authState.state.creds);
-            }
-        }
-    };
-    return authState;
+// ✅ CORREÇÃO CRÍTICA: Usar useMultiFileAuthState (padrão do Baileys 6.7.18)
+const getAuthState = async (sessionId) => {
+    const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
+
+    try {
+        await fs.mkdir(authPath, { recursive: true });
+        return await useMultiFileAuthState(authPath);
+    } catch (err) {
+        console.error(`[SESSION ${sessionId}] Auth state error:`, err.message);
+        throw err;
+    }
 };
 
-// ✅ START SESSION - OTIMIZADO PARA 6.7.18
+// ✅ Limpar auth state
+const clearAuthState = async (sessionId) => {
+    const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
+
+    try {
+        await fs.rm(authPath, { recursive: true, force: true });
+        console.log(`[SESSION ${sessionId}] Auth state cleared`);
+    } catch (err) {
+        console.error(`[SESSION ${sessionId}] Clear auth error:`, err.message);
+    }
+};
+
+// ✅ START SESSION - CORRIGIDO PARA 6.7.18
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -197,81 +98,72 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         };
         activeSessions.set(String(sessionId), sessionEntry);
 
-        const authState = createAuthStateFromDB(sessionId);
-        const savedCreds = await authDB.read(sessionId, 'creds');
+        // ✅ CORREÇÃO: Usar useMultiFileAuthState
+        const { state, saveCreds } = await getAuthState(sessionId);
 
-        if (savedCreds && isValidCredentials(savedCreds)) {
-            authState.state.creds = savedCreds;
-            console.log(`[SESSION ${sessionId}] ✅ Loaded creds from DB`);
-        } else if (savedCreds) {
-            console.warn(`[SESSION ${sessionId}] Creds inválidas. Starting fresh.`);
-            await authDB.clearAll(sessionId);
-            authState.state.creds = createDefaultCreds(); // ✅ Reinicializar
+        // ✅ Verificar se há credenciais válidas
+        const hasValidCreds = state.creds?.me?.id;
+
+        if (hasValidCreds) {
+            console.log(`[SESSION ${sessionId}] ✅ Found existing credentials`);
         } else {
-            console.log(`[SESSION ${sessionId}] No creds found. Starting fresh connection.`);
-            authState.state.creds = createDefaultCreds(); // ✅ Garantir inicialização
+            console.log(`[SESSION ${sessionId}] 🆕 Starting fresh connection`);
         }
 
         const { version } = await fetchLatestBaileysVersion();
 
-        // ✅ DEBUG: Verificar creds
-        if (!authState.state.creds) {
-            throw new Error(`[SESSION ${sessionId}] creds is undefined!`);
-        }
-        if (!authState.state.creds.noiseKey) {
-            throw new Error(`[SESSION ${sessionId}] creds.noiseKey is undefined!`);
-        }
-
-        console.log(`[SESSION ${sessionId}] ✅ Auth state initialized correctly`);
-
-        // ✅ CRÍTICO: Configurações para 6.7.18 (evita memory leak)
+        // ✅ CONFIGURAÇÃO OTIMIZADA PARA 6.7.18
         const waSocket = makeWASocket({
-            auth: authState.state,
+            auth: state,
             version,
             printQRInTerminal: false,
-            browser: ['PDVix Platform', 'Chrome', '1.0.0'],
+            browser: ['PDVix Platform', 'Chrome', '120.0.0'],
             logger: createLogger(sessionId),
 
-            // ✅ 6.7.18: Memory optimization (FUNDAMENTAL!)
+            // ✅ CRÍTICO: Configurações para evitar 428
             syncFullHistory: false,
             markOnlineOnConnect: false,
             emitOwnEvents: false,
-            getMessage: async () => undefined,
-            shouldSyncHistoryMessage: () => false,
+            generateHighQualityLinkPreview: false,
 
-            // ✅ Timeouts
-            defaultQueryTimeoutMs: 10000,
+            // ✅ getMessage otimizado
+            getMessage: async (key) => {
+                return { conversation: 'Mensagem não disponível' };
+            },
+
+            // ✅ Timeouts ajustados
+            defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 30000,
+            qrTimeout: 60000,
 
-            // ✅ Limitar processamento
+            // ✅ Filtros
             shouldIgnoreJid: (jid) => {
                 return jid.endsWith('@g.us') ||
                        jid.endsWith('@broadcast') ||
                        jid === 'status@broadcast';
             },
 
-            // ✅ 6.7.18: Limitar cache de chamadas
-            maxMissedCallLogs: 5,
-            retryRequestDelayMs: 100
+            // ✅ Retry config
+            retryRequestDelayMs: 250,
+            maxMsgRetryCount: 3,
+
+            // ✅ NOVO: Link device config (importante para 6.7.18)
+            linkPreviewImageThumbnailWidth: 192,
+            transactionOpts: {
+                maxCommitRetries: 3,
+                delayBetweenTriesMs: 250
+            }
         });
 
         sessionEntry.sock = waSocket;
 
-        // ✅ EVENT: Credenciais atualizadas
-        waSocket.ev.on('creds.update', async (update) => {
-            try {
-                console.log(`[SESSION ${sessionId}] 💾 Creds update`);
-                Object.assign(authState.state.creds || {}, update);
-                await authState.saveCreds();
-            } catch (err) {
-                console.error(`[SESSION ${sessionId}] Creds update error:`, err.message);
-            }
-        });
+        // ✅ EVENT: Salvar credenciais (CRÍTICO)
+        waSocket.ev.on('creds.update', saveCreds);
 
-        // ✅ EVENT: Connection status
+        // ✅ EVENT: Connection
         waSocket.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
+            const { connection, lastDisconnect, qr, isNewLogin } = update;
 
             if (connection === 'connecting') {
                 sessionEntry.status = 'connecting';
@@ -281,14 +173,18 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             if (connection === 'open') {
                 sessionEntry.status = 'open';
                 sessionEntry.lastError = null;
-                console.log(`[SESSION ${sessionId}] ✅ Connected as ${waSocket.user?.name}`);
+
+                const userName = waSocket.user?.name || 'Unknown';
+                const userId = waSocket.user?.id || 'Unknown';
+
+                console.log(`[SESSION ${sessionId}] ✅ Connected as ${userName} (${userId})`);
 
                 if (sessionId !== PLATFORM_BOT_ID) {
                     notifyFastAPI({
                         storeId: sessionId,
                         status: 'connected',
-                        whatsappName: waSocket.user?.name,
-                        whatsappId: waSocket.user?.id,
+                        whatsappName: userName,
+                        whatsappId: userId,
                         isActive: true
                     }).catch((err) => {
                         console.error(`[SESSION ${sessionId}] Notify error:`, err.message);
@@ -297,7 +193,8 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             }
 
             if (qr) {
-                console.log(`[SESSION ${sessionId}] 🔲 QR Code`);
+                console.log(`[SESSION ${sessionId}] 📲 QR Code generated`);
+
                 if (sessionId !== PLATFORM_BOT_ID) {
                     notifyFastAPI({
                         storeId: sessionId,
@@ -309,22 +206,35 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
                 sessionEntry.status = 'disconnected';
                 console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode})`);
+
                 activeSessions.delete(String(sessionId));
 
-                // ✅ Limpar creds em caso de erro de autenticação
-                if ([DisconnectReason.loggedOut, 401, 403].includes(statusCode)) {
-                    console.log(`[SESSION ${sessionId}] Auth error. Clearing creds.`);
-                    await authDB.clearAll(sessionId);
-                } else if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
+                // ✅ CORREÇÃO: Limpar auth em casos específicos
+                if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
+                    console.log(`[SESSION ${sessionId}] 🗑️ Clearing auth state...`);
+                    await clearAuthState(sessionId);
+                }
+
+                // ✅ CORREÇÃO: Retry apenas se não for logout
+                if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
                     const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 30000);
-                    console.log(`[SESSION ${sessionId}] Retrying in ${delay}ms...`);
-                    setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), delay);
+                    console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay}ms...`);
+
+                    setTimeout(() => {
+                        startSession(sessionId, phoneNumber, method, attempt + 1);
+                    }, delay);
                 }
 
                 if (sessionId !== PLATFORM_BOT_ID) {
-                    notifyFastAPI({ storeId: sessionId, status: 'disconnected' }).catch(() => {});
+                    notifyFastAPI({
+                        storeId: sessionId,
+                        status: 'disconnected',
+                        reason: statusCode ? `Error ${statusCode}` : 'Unknown'
+                    }).catch(() => {});
                 }
             }
         });
@@ -349,7 +259,6 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                     }
                 }
 
-                // ✅ 6.7.18: Não bloquear encaminhamento
                 forwardMessageToFastAPI(sessionId, msg, waSocket).catch(() => {});
             }
         });
@@ -358,9 +267,13 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         if (method === 'pairing' && phoneNumber) {
             try {
                 console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
-                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                // ✅ CRÍTICO: Aguardar socket estar pronto
+                await new Promise(resolve => setTimeout(resolve, 3000));
+
                 const code = await waSocket.requestPairingCode(phoneNumber);
                 const formatted = code.match(/.{1,4}/g).join('-');
+
                 console.log(`[SESSION ${sessionId}] ✅ Pairing Code: ${formatted}`);
 
                 if (sessionId !== PLATFORM_BOT_ID) {
@@ -373,8 +286,12 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             } catch (err) {
                 console.error(`[SESSION ${sessionId}] Pairing error:`, err.message);
                 sessionEntry.status = 'error';
-                waSocket.end();
-                await authDB.clearAll(sessionId);
+
+                if (waSocket.end) {
+                    waSocket.end(undefined);
+                }
+
+                await clearAuthState(sessionId);
                 activeSessions.delete(String(sessionId));
             }
         }
@@ -396,15 +313,16 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     }
 };
 
-// ✅ FUNÇÕES AUXILIARES (mantidas)
+// ✅ DISCONNECT
 const disconnectSession = async (sessionId) => {
     const session = activeSessions.get(String(sessionId));
     try {
         if (session?.sock) {
-            session.sock.logout('Disconnect requested');
+            session.sock.logout();
         }
-        await authDB.clearAll(sessionId);
+        await clearAuthState(sessionId);
         activeSessions.delete(String(sessionId));
+
         if (sessionId !== PLATFORM_BOT_ID) {
             notifyFastAPI({ storeId: sessionId, status: 'disconnected' }).catch(() => {});
         }
@@ -413,6 +331,7 @@ const disconnectSession = async (sessionId) => {
     }
 };
 
+// ✅ SEND MESSAGE
 const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename) => {
     const session = activeSessions.get(String(sessionId));
     if (!session?.sock || session.status !== 'open' || !session.sock.user) return false;
@@ -432,9 +351,11 @@ const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, medi
         }
 
         const result = await session.sock.sendMessage(chatId, payload);
+
         if (result && sessionId !== PLATFORM_BOT_ID) {
             forwardMessageToFastAPI(sessionId, result, session.sock).catch(() => {});
         }
+
         return true;
     } catch (err) {
         console.error(`[SESSION ${sessionId}] Send error:`, err.message);
@@ -442,19 +363,30 @@ const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, medi
     }
 };
 
+// ✅ RESTORE SESSIONS
 const restoreActiveSessions = async () => {
     if (isRestoringComplete) return;
+
+    await ensureAuthDir();
+
     console.log('[RESTORE] 🔄 Starting...');
+
     try {
         const stores = await getStoresToReconnect();
+
         if (stores.length === 0) {
+            console.log('[RESTORE] ℹ️ No stores to restore');
             isRestoringComplete = true;
             return;
         }
+
+        console.log(`[RESTORE] Found ${stores.length} stores to restore`);
+
         for (const store of stores) {
             startSession(String(store.store_id), undefined, 'qr');
             await new Promise(resolve => setTimeout(resolve, SESSION_RESTORE_DELAY));
         }
+
         isRestoringComplete = true;
         console.log('[RESTORE] ✅ Complete');
     } catch (err) {
@@ -463,19 +395,24 @@ const restoreActiveSessions = async () => {
     }
 };
 
+// ✅ PAUSE CHAT
 const pauseChatForHuman = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session || session.status !== 'open') return false;
+
     const cacheKey = `state:${chatId}`;
     const { value: state } = await cacheManager.get('conversationState', cacheKey) || { value: {} };
     state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
     await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
+
     return true;
 };
 
+// ✅ PROFILE PICTURE
 const getProfilePictureUrl = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session?.sock || session.status !== 'open') return null;
+
     try {
         return await session.sock.profilePictureUrl(chatId, 'image');
     } catch {
@@ -483,9 +420,11 @@ const getProfilePictureUrl = async (storeId, chatId) => {
     }
 };
 
+// ✅ CONTACT NAME
 const getContactName = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session?.sock || session.status !== 'open') return null;
+
     try {
         const [result] = await session.sock.onWhatsApp(chatId);
         return result?.exists ? result.jid.split('@')[0] : null;
@@ -494,23 +433,29 @@ const getContactName = async (storeId, chatId) => {
     }
 };
 
+// ✅ PLATFORM MESSAGE
 const sendPlatformMessage = async (number, message) => {
     return await sendMessage(PLATFORM_BOT_ID, number, message, null, null, null);
 };
 
+// ✅ SHUTDOWN
 const shutdown = async () => {
     console.log('[SHUTDOWN] 🛑 Starting...');
+
     const promises = [];
     for (const [storeId, session] of activeSessions.entries()) {
         if (session.sock && session.status === 'open') {
-            promises.push(session.sock.end().catch(() => {}));
+            promises.push(session.sock.end(undefined).catch(() => {}));
         }
     }
+
     await Promise.all(promises);
     activeSessions.clear();
+
     console.log('[SHUTDOWN] ✅ Complete');
 };
 
+// ✅ GET SOCKET
 const getSocketForStore = (storeId) => {
     const session = activeSessions.get(String(storeId));
     return (session && session.sock && session.status === 'open') ? session.sock : null;
