@@ -1,9 +1,11 @@
-// services/whatsappService.js - OTIMIZADO PARA BAILEYS 6.7.18
+// services/whatsappService.js - CORRIGIDO PARA ES MODULES
 
-import makeWASocket, {
-    DisconnectReason,
-    fetchLatestBaileysVersion
-} from '@whiskeysockets/baileys';
+// ✅ CORREÇÃO CRÍTICA: Usar import dinâmico ou syntax correto
+import { makeWASocket as makeWASocketFn, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+
+// ✅ RENOMEAR para evitar conflitos
+const makeWASocket = makeWASocketFn;
+
 import { Boom } from '@hapi/boom';
 import { getStoresToReconnect, updateConversationMetadata } from './chatbotService.js';
 import { notifyFastAPI } from '../utils/notifications.js';
@@ -190,6 +192,13 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         }
 
         const { version } = await fetchLatestBaileysVersion();
+
+        // ✅ DEBUG: Verificar se makeWASocket é uma função
+        if (typeof makeWASocket !== 'function') {
+            throw new Error(`makeWASocket is not a function! Type: ${typeof makeWASocket}`);
+        }
+
+        console.log(`[SESSION ${sessionId}] ✅ makeWASocket is ready`);
 
         // ✅ CRÍTICO: Configurações para 6.7.18 (evita memory leak)
         const waSocket = makeWASocket({
