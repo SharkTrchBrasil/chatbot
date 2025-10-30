@@ -1,4 +1,4 @@
-// services/whatsappService.js - CORRIGIDO PARA 6.7.18 (428 ERROR FIX)
+// services/whatsappService.js - VERSÃO HÍBRIDA (DB + Filesystem) COM ANTI-BAN
 
 import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -19,63 +19,162 @@ const activeSessions = new Map();
 const PLATFORM_BOT_ID = 'platform';
 export const INACTIVITY_PAUSE_MS = 30 * 60 * 1000;
 const MAX_RESTORE_ATTEMPTS = 3;
-const SESSION_RESTORE_DELAY = 5000;
+const SESSION_RESTORE_DELAY = 10000; // ⬆️ AUMENTADO: 10s entre tentativas
 
 let isRestoringComplete = false;
 
-// ✅ CRÍTICO: Diretório para auth_info (6.7.18 requer filesystem)
+// ✅ Diretório temporário (sincronizado com DB)
 const AUTH_DIR = path.join(__dirname, '..', 'auth_sessions');
 
-// ✅ Garantir que o diretório existe
+// ✅ ANTI-BAN: Delay entre operações
+const OPERATION_DELAY = 2000;
+const antiSpamDelay = () => new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
+
+// ✅ Garantir diretório
 const ensureAuthDir = async () => {
     try {
         await fs.mkdir(AUTH_DIR, { recursive: true });
     } catch (err) {
-        console.error('[AUTH] Failed to create auth dir:', err.message);
+        console.error('[AUTH] Failed to create dir:', err.message);
     }
 };
 
-// ✅ Logger otimizado
+// ✅ Logger silencioso
 const createLogger = (sessionId) => ({
     level: 'silent',
     trace: () => {},
     debug: () => {},
-    info: (msg) => {
-        if (process.env.NODE_ENV === 'development') {
-            console.log(`[SESSION ${sessionId}][INFO]`, msg);
+    info: () => {},
+    warn: (msg) => {
+        if (msg.includes('myAppStateKeyId') || msg.includes('no name present')) {
+            return; // Silenciar warnings conhecidos
         }
+        console.warn(`[SESSION ${sessionId}][WARN]`, msg);
     },
-    warn: (msg) => console.warn(`[SESSION ${sessionId}][WARN]`, msg),
-    error: (msg) => console.error(`[SESSION ${sessionId}][ERROR]`, msg),
+    error: (msg) => {
+        if (typeof msg === 'object' && msg.node?.attrs?.code === '515') {
+            return; // Silenciar erro 515 (já logamos no handler)
+        }
+        console.error(`[SESSION ${sessionId}][ERROR]`, msg);
+    },
     child: () => createLogger(sessionId)
 });
 
-// ✅ CORREÇÃO CRÍTICA: Usar useMultiFileAuthState (padrão do Baileys 6.7.18)
+// ✅ BANCO DE DADOS: Salvar credenciais
+const saveCredsToDatabase = async (sessionId, creds) => {
+    const client = await pool.connect();
+    try {
+        // Limpar credenciais antigas
+        await client.query(
+            'DELETE FROM chatbot_auth_credentials WHERE session_id = $1',
+            [`store_${sessionId}`]
+        );
+
+        // Salvar novas credenciais
+        await client.query(
+            `INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value)
+             VALUES ($1, $2, $3)`,
+            [`store_${sessionId}`, 'creds', creds]
+        );
+
+        console.log(`[DB] ✅ Credentials saved for store ${sessionId}`);
+    } catch (err) {
+        console.error(`[DB] Failed to save creds for store ${sessionId}:`, err.message);
+    } finally {
+        client.release();
+    }
+};
+
+// ✅ BANCO DE DADOS: Carregar credenciais
+const loadCredsFromDatabase = async (sessionId) => {
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            'SELECT cred_value FROM chatbot_auth_credentials WHERE session_id = $1 AND cred_id = $2',
+            [`store_${sessionId}`, 'creds']
+        );
+
+        if (rows.length > 0) {
+            console.log(`[DB] ✅ Credentials loaded for store ${sessionId}`);
+            return rows[0].cred_value;
+        }
+
+        return null;
+    } catch (err) {
+        console.error(`[DB] Failed to load creds for store ${sessionId}:`, err.message);
+        return null;
+    } finally {
+        client.release();
+    }
+};
+
+// ✅ BANCO DE DADOS: Limpar credenciais
+const clearCredsFromDatabase = async (sessionId) => {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            'DELETE FROM chatbot_auth_credentials WHERE session_id = $1',
+            [`store_${sessionId}`]
+        );
+        console.log(`[DB] 🗑️ Credentials cleared for store ${sessionId}`);
+    } catch (err) {
+        console.error(`[DB] Failed to clear creds for store ${sessionId}:`, err.message);
+    } finally {
+        client.release();
+    }
+};
+
+// ✅ HÍBRIDO: Auth state (filesystem + sync para DB)
 const getAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
     try {
         await fs.mkdir(authPath, { recursive: true });
-        return await useMultiFileAuthState(authPath);
+
+        // Tentar restaurar do banco para o filesystem (se não existir localmente)
+        try {
+            await fs.access(path.join(authPath, 'creds.json'));
+        } catch {
+            // Arquivo não existe, tentar restaurar do banco
+            const dbCreds = await loadCredsFromDatabase(sessionId);
+            if (dbCreds) {
+                await fs.writeFile(
+                    path.join(authPath, 'creds.json'),
+                    JSON.stringify(dbCreds, null, 2)
+                );
+                console.log(`[AUTH] ✅ Restored creds from DB for store ${sessionId}`);
+            }
+        }
+
+        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+
+        // Wrapper para salvar no DB também
+        const saveCredsHybrid = async () => {
+            await saveCreds(); // Salva no filesystem
+            await saveCredsToDatabase(sessionId, state.creds); // Salva no DB
+        };
+
+        return { state, saveCreds: saveCredsHybrid };
     } catch (err) {
-        console.error(`[SESSION ${sessionId}] Auth state error:`, err.message);
+        console.error(`[AUTH] Error for store ${sessionId}:`, err.message);
         throw err;
     }
 };
 
-// ✅ Limpar auth state
+// ✅ Limpar auth completo (filesystem + DB)
 const clearAuthState = async (sessionId) => {
     const authPath = path.join(AUTH_DIR, `session_${sessionId}`);
 
     try {
         await fs.rm(authPath, { recursive: true, force: true });
-        console.log(`[SESSION ${sessionId}] Auth state cleared`);
+        await clearCredsFromDatabase(sessionId);
+        console.log(`[AUTH] 🗑️ Cleared auth for store ${sessionId}`);
     } catch (err) {
-        console.error(`[SESSION ${sessionId}] Clear auth error:`, err.message);
+        console.error(`[AUTH] Clear error for store ${sessionId}:`, err.message);
     }
 };
 
-// ✅ START SESSION - CORRIGIDO PARA 6.7.18
+// ✅ START SESSION - ANTI-BAN + HÍBRIDO
 const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
     if (activeSessions.has(String(sessionId))) {
         const existing = activeSessions.get(String(sessionId));
@@ -87,6 +186,11 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
     console.log(`[SESSION ${sessionId}] Starting (${method}, attempt ${attempt})...`);
 
+    // ✅ ANTI-BAN: Delay entre tentativas
+    if (attempt > 1) {
+        await antiSpamDelay();
+    }
+
     try {
         const sessionEntry = {
             sock: null,
@@ -94,14 +198,13 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             status: 'connecting',
             isActive: true,
             createdAt: Date.now(),
-            lastError: null
+            lastError: null,
+            messageCount: 0
         };
         activeSessions.set(String(sessionId), sessionEntry);
 
-        // ✅ CORREÇÃO: Usar useMultiFileAuthState
         const { state, saveCreds } = await getAuthState(sessionId);
 
-        // ✅ Verificar se há credenciais válidas
         const hasValidCreds = state.creds?.me?.id;
 
         if (hasValidCreds) {
@@ -112,29 +215,28 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
         const { version } = await fetchLatestBaileysVersion();
 
-        // ✅ CONFIGURAÇÃO OTIMIZADA PARA 6.7.18
+        // ✅ ANTI-BAN: Configurações conservadoras
         const waSocket = makeWASocket({
             auth: state,
             version,
             printQRInTerminal: false,
-            browser: ['PDVix Platform', 'Chrome', '120.0.0'],
+            browser: ['PDVix', 'Chrome', '120.0.0'], // ⬇️ Nome genérico
             logger: createLogger(sessionId),
 
-            // ✅ CRÍTICO: Configurações para evitar 428
+            // ✅ ANTI-BAN CRÍTICO
             syncFullHistory: false,
             markOnlineOnConnect: false,
             emitOwnEvents: false,
             generateHighQualityLinkPreview: false,
 
-            // ✅ getMessage otimizado
             getMessage: async (key) => {
-                return { conversation: 'Mensagem não disponível' };
+                return { conversation: '' };
             },
 
-            // ✅ Timeouts ajustados
+            // ✅ Timeouts aumentados
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 30000,
+            keepAliveIntervalMs: 45000, // ⬆️ Menos agressivo
             qrTimeout: 60000,
 
             // ✅ Filtros
@@ -144,26 +246,26 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                        jid === 'status@broadcast';
             },
 
-            // ✅ Retry config
-            retryRequestDelayMs: 250,
-            maxMsgRetryCount: 3,
+            // ✅ ANTI-BAN: Retry conservador
+            retryRequestDelayMs: 500,
+            maxMsgRetryCount: 2,
 
-            // ✅ NOVO: Link device config (importante para 6.7.18)
+            // ✅ Link preview
             linkPreviewImageThumbnailWidth: 192,
             transactionOpts: {
-                maxCommitRetries: 3,
-                delayBetweenTriesMs: 250
+                maxCommitRetries: 2,
+                delayBetweenTriesMs: 500
             }
         });
 
         sessionEntry.sock = waSocket;
 
-        // ✅ EVENT: Salvar credenciais (CRÍTICO)
+        // ✅ EVENT: Salvar credenciais (filesystem + DB)
         waSocket.ev.on('creds.update', saveCreds);
 
         // ✅ EVENT: Connection
         waSocket.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr, isNewLogin } = update;
+            const { connection, lastDisconnect, qr } = update;
 
             if (connection === 'connecting') {
                 sessionEntry.status = 'connecting';
@@ -177,7 +279,10 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 const userName = waSocket.user?.name || 'Unknown';
                 const userId = waSocket.user?.id || 'Unknown';
 
-                console.log(`[SESSION ${sessionId}] ✅ Connected as ${userName} (${userId})`);
+                console.log(`[SESSION ${sessionId}] ✅ Connected as ${userName}`);
+
+                // ✅ ANTI-BAN: Delay antes de notificar
+                await antiSpamDelay();
 
                 if (sessionId !== PLATFORM_BOT_ID) {
                     notifyFastAPI({
@@ -209,20 +314,35 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
                 sessionEntry.status = 'disconnected';
-                console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode})`);
+
+                // ✅ Logs informativos baseados no código
+                if (statusCode === 515) {
+                    console.log(`[SESSION ${sessionId}] ⚠️ Rate limit (515) - waiting before retry`);
+                } else if (statusCode === 401) {
+                    console.log(`[SESSION ${sessionId}] ❌ Unauthorized (401) - clearing auth`);
+                } else {
+                    console.log(`[SESSION ${sessionId}] ❌ Closed (Code: ${statusCode || 'unknown'})`);
+                }
 
                 activeSessions.delete(String(sessionId));
 
-                // ✅ CORREÇÃO: Limpar auth em casos específicos
+                // ✅ Limpar auth em casos críticos
                 if ([DisconnectReason.loggedOut, 401, 403, 440].includes(statusCode)) {
-                    console.log(`[SESSION ${sessionId}] 🗑️ Clearing auth state...`);
                     await clearAuthState(sessionId);
                 }
 
-                // ✅ CORREÇÃO: Retry apenas se não for logout
+                // ✅ ANTI-BAN: Retry com backoff exponencial
                 if (shouldReconnect && attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
-                    const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 30000);
-                    console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay}ms...`);
+                    let delay = SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1);
+
+                    // ✅ ANTI-BAN: Aumentar delay em caso de 515 (rate limit)
+                    if (statusCode === 515) {
+                        delay = Math.max(delay, 30000); // Mínimo 30s
+                    }
+
+                    delay = Math.min(delay, 120000); // Máximo 2min
+
+                    console.log(`[SESSION ${sessionId}] ⏳ Retrying in ${delay / 1000}s...`);
 
                     setTimeout(() => {
                         startSession(sessionId, phoneNumber, method, attempt + 1);
@@ -239,7 +359,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             }
         });
 
-        // ✅ EVENT: Mensagens
+        // ✅ EVENT: Mensagens (COM CORREÇÃO DO CRASH)
         waSocket.ev.on('messages.upsert', async (m) => {
             for (const msg of m.messages || []) {
                 if (!msg?.key?.remoteJid || !msg.message || msg.key.fromMe) continue;
@@ -247,18 +367,32 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
                 const chatId = msg.key.remoteJid;
                 if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) continue;
 
+                // ✅ ANTI-BAN: Limitar taxa de processamento
+                sessionEntry.messageCount++;
+                if (sessionEntry.messageCount > 50) {
+                    await antiSpamDelay();
+                    sessionEntry.messageCount = 0;
+                }
+
                 if (sessionId !== PLATFORM_BOT_ID) {
-                    updateConversationMetadata(sessionId, msg);
+                    updateConversationMetadata(sessionId, msg).catch(() => {});
 
                     const cacheKey = `state:${chatId}`;
-                    const { value: state } = await cacheManager.get('conversationState', cacheKey) || { value: {} };
+
+                    // ✅ CORREÇÃO DO CRASH: Inicializar state se null
+                    let stateResult = await cacheManager.get('conversationState', cacheKey);
+                    let state = stateResult?.value || {}; // ⬅️ FIX: Default para {}
 
                     if (!state.humanSupportUntil || new Date() >= new Date(state.humanSupportUntil)) {
-                        await processMessage(msg, sessionId, waSocket, state);
+                        await processMessage(msg, sessionId, waSocket, state).catch(err => {
+                            console.error(`[SESSION ${sessionId}] Message processing error:`, err.message);
+                        });
+
                         await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
                     }
                 }
 
+                // ✅ Encaminhar para FastAPI (não bloquear)
                 forwardMessageToFastAPI(sessionId, msg, waSocket).catch(() => {});
             }
         });
@@ -268,8 +402,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
             try {
                 console.log(`[SESSION ${sessionId}] ⏳ Requesting pairing code...`);
 
-                // ✅ CRÍTICO: Aguardar socket estar pronto
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                await antiSpamDelay();
 
                 const code = await waSocket.requestPairingCode(phoneNumber);
                 const formatted = code.match(/.{1,4}/g).join('-');
@@ -298,7 +431,6 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
 
     } catch (error) {
         console.error(`[SESSION ${sessionId}] CRITICAL ERROR:`, error.message);
-        console.error(error.stack);
 
         const entry = activeSessions.get(String(sessionId));
         if (entry) {
@@ -307,7 +439,7 @@ const startSession = async (sessionId, phoneNumber, method, attempt = 1) => {
         }
 
         if (attempt < MAX_RESTORE_ATTEMPTS && isRestoringComplete) {
-            const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 30000);
+            const delay = Math.min(SESSION_RESTORE_DELAY * Math.pow(2, attempt - 1), 120000);
             setTimeout(() => startSession(sessionId, phoneNumber, method, attempt + 1), delay);
         }
     }
@@ -331,12 +463,15 @@ const disconnectSession = async (sessionId) => {
     }
 };
 
-// ✅ SEND MESSAGE
+// ✅ SEND MESSAGE (COM ANTI-BAN)
 const sendMessage = async (sessionId, number, message, mediaUrl, mediaType, mediaFilename) => {
     const session = activeSessions.get(String(sessionId));
     if (!session?.sock || session.status !== 'open' || !session.sock.user) return false;
 
     try {
+        // ✅ ANTI-BAN: Delay entre mensagens
+        await antiSpamDelay();
+
         const chatId = `${number.replace(/\D/g, '')}@s.whatsapp.net`;
         let payload;
 
@@ -384,6 +519,8 @@ const restoreActiveSessions = async () => {
 
         for (const store of stores) {
             startSession(String(store.store_id), undefined, 'qr');
+
+            // ✅ ANTI-BAN: Espaçar restaurações
             await new Promise(resolve => setTimeout(resolve, SESSION_RESTORE_DELAY));
         }
 
@@ -395,20 +532,21 @@ const restoreActiveSessions = async () => {
     }
 };
 
-// ✅ PAUSE CHAT
+// ✅ Funções auxiliares (mantidas)
 const pauseChatForHuman = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session || session.status !== 'open') return false;
 
     const cacheKey = `state:${chatId}`;
-    const { value: state } = await cacheManager.get('conversationState', cacheKey) || { value: {} };
+    let stateResult = await cacheManager.get('conversationState', cacheKey);
+    let state = stateResult?.value || {};
+
     state.humanSupportUntil = new Date(Date.now() + INACTIVITY_PAUSE_MS);
     await cacheManager.set('conversationState', cacheKey, state, INACTIVITY_PAUSE_MS / 1000);
 
     return true;
 };
 
-// ✅ PROFILE PICTURE
 const getProfilePictureUrl = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session?.sock || session.status !== 'open') return null;
@@ -420,7 +558,6 @@ const getProfilePictureUrl = async (storeId, chatId) => {
     }
 };
 
-// ✅ CONTACT NAME
 const getContactName = async (storeId, chatId) => {
     const session = activeSessions.get(String(storeId));
     if (!session?.sock || session.status !== 'open') return null;
@@ -433,12 +570,10 @@ const getContactName = async (storeId, chatId) => {
     }
 };
 
-// ✅ PLATFORM MESSAGE
 const sendPlatformMessage = async (number, message) => {
     return await sendMessage(PLATFORM_BOT_ID, number, message, null, null, null);
 };
 
-// ✅ SHUTDOWN
 const shutdown = async () => {
     console.log('[SHUTDOWN] 🛑 Starting...');
 
@@ -455,7 +590,6 @@ const shutdown = async () => {
     console.log('[SHUTDOWN] ✅ Complete');
 };
 
-// ✅ GET SOCKET
 const getSocketForStore = (storeId) => {
     const session = activeSessions.get(String(storeId));
     return (session && session.sock && session.status === 'open') ? session.sock : null;
