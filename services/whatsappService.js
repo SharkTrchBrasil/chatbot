@@ -60,7 +60,7 @@ const createLogger = (sessionId) => ({
     child: () => createLogger(sessionId)
 });
 
-// ✅ BANCO DE DADOS: Salvar credenciais
+// âœ… BANCO DE DADOS: Salvar credenciais
 const saveCredsToDatabase = async (sessionId, creds) => {
     const client = await pool.connect();
     try {
@@ -70,20 +70,21 @@ const saveCredsToDatabase = async (sessionId, creds) => {
             [`store_${sessionId}`]
         );
 
-        // Salvar novas credenciais
+        // âœ… ADICIONAR updated_at NA QUERY
         await client.query(
-            `INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value)
-             VALUES ($1, $2, $3)`,
+            `INSERT INTO chatbot_auth_credentials (session_id, cred_id, cred_value, updated_at)
+             VALUES ($1, $2, $3, NOW())`,
             [`store_${sessionId}`, 'creds', creds]
         );
 
-        console.log(`[DB] ✅ Credentials saved for store ${sessionId}`);
+        console.log(`[DB] âœ… Credentials saved for store ${sessionId}`);
     } catch (err) {
         console.error(`[DB] Failed to save creds for store ${sessionId}:`, err.message);
     } finally {
         client.release();
     }
 };
+
 
 // ✅ BANCO DE DADOS: Carregar credenciais
 const loadCredsFromDatabase = async (sessionId) => {
