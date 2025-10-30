@@ -40,23 +40,30 @@ const ensureAuthDir = async () => {
     }
 };
 
-// ✅ Logger silencioso
+// ✅ CORREÇÃO 1: Substitua a função createLogger (por volta da linha ~45)
+
 const createLogger = (sessionId) => ({
     level: 'silent',
     trace: () => {},
     debug: () => {},
     info: () => {},
     warn: (msg) => {
-        if (msg.includes('myAppStateKeyId') || msg.includes('no name present')) {
-            return; // Silenciar warnings conhecidos
+        // ✅ CONVERTER PARA STRING PRIMEIRO
+        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
+
+        if (msgStr.includes('myAppStateKeyId') || msgStr.includes('no name present')) {
+            return;
         }
-        console.warn(`[SESSION ${sessionId}][WARN]`, msg);
+        console.warn(`[SESSION ${sessionId}][WARN]`, msgStr);
     },
     error: (msg) => {
-        if (typeof msg === 'object' && msg.node?.attrs?.code === '515') {
-            return; // Silenciar erro 515 (já logamos no handler)
+        // ✅ CONVERTER PARA STRING PRIMEIRO
+        const msgStr = typeof msg === 'string' ? msg : JSON.stringify(msg);
+
+        if (typeof msg === 'object' && msg?.node?.attrs?.code === '515') {
+            return;
         }
-        console.error(`[SESSION ${sessionId}][ERROR]`, msg);
+        console.error(`[SESSION ${sessionId}][ERROR]`, msgStr);
     },
     child: () => createLogger(sessionId)
 });
