@@ -117,7 +117,7 @@ router.post('/send-message',
     [
         body('storeId').isInt({ min: 1 }),
         body('number').matches(/^\d{10,15}$/),
-        body('message').optional().isString().isLength({ max: 4096 }),
+        body('message').optional().isString().isLength({ min: 1, max: 4096 }),
         body('mediaUrl').optional().isURL(),
         body('mediaType').optional().isIn(['image', 'audio', 'document']),
         body('mediaFilename').optional().isString().isLength({ max: 255 })
@@ -130,6 +130,10 @@ router.post('/send-message',
             return res.status(400).json({
                 error: 'Either message or mediaUrl is required'
             });
+        }
+
+        if (message && !message.trim()) {
+            return res.status(400).json({ error: 'message cannot be blank' });
         }
 
         try {

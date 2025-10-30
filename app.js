@@ -4,15 +4,18 @@ import express from 'express';
 import helmet from 'helmet';
 import compression from 'compression';
 import dotenv from 'dotenv';
+import cors from 'cors';
 
 // ✅ Imports dos serviços e rotas
 import apiRoutes from './routes/apiRoutes.js';
 import platformApiRoutes from './routes/platformApiRoutes.js';
 import whatsappService from './services/whatsappService.js';
-import { startDLQProcessor } from './utils/forwarder.js';
+import { startDLQProcessor, stopDLQProcessor } from './utils/forwarder.js';
 import { checkHealth as checkDbHealth, closePool } from './config/database.js';
 import { metricsCollector, startResourceMonitoring } from './middleware/monitoring.js';
 import { cacheManager } from './services/cacheService.js';
+import { verifyHmacSignature } from './middleware/hmacAuth.js';
+import { correlationIdMiddleware } from './middleware/correlationId.js';
 
 dotenv.config();
 
@@ -23,12 +26,51 @@ const PORT = process.env.PORT || 8080;
 // ✅ MIDDLEWARE DE SEGURANÇA E PERFORMANCE
 // ============================================================
 app.use(helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+        useDefaults: true,
+        directives: {
+            defaultSrc: ["'none'"],
+            imgSrc: ["'self'", 'data:'],
+            connectSrc: ["'self'", process.env.FASTAPI_URL || ''],
+        }
+    },
     crossOriginEmbedderPolicy: false
 }));
 app.use(compression());
 app.use(express.json({ limit: '10mb' })); // Aumentado para 10mb para uploads de mídia
 app.disable('x-powered-by');
+app.use(correlationIdMiddleware);
+
+// ============================================================
+// ✅ CORS CONFIGURADO (com suporte a HMAC/correlation headers)
+// ============================================================
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin) return callback(null, true); // permitir ferramentas locais (curl, etc.)
+        if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'x-webhook-secret',
+        'x-signature',
+        'x-timestamp',
+        'x-nonce',
+        'x-correlation-id'
+    ],
+    exposedHeaders: ['x-correlation-id'],
+    optionsSuccessStatus: 204
+}));
 
 // ============================================================
 // ✅ ROTAS DE HEALTH CHECK E MÉTRICAS
@@ -65,10 +107,10 @@ app.get('/metrics', (req, res) => {
 // ✅ ROTAS DA APLICAÇÃO (COM AUTENTICAÇÃO)
 // ============================================================
 
-// Rotas para o Python (FastAPI) controlar este serviço
-app.use('/api', apiRoutes);
-// Rotas para o bot da plataforma (envio de notificações)
-app.use('/platform-api', platformApiRoutes);
+// Rotas para o Python (FastAPI) controlar este serviço (protegidas por HMAC)
+app.use('/api', verifyHmacSignature(), apiRoutes);
+// Rotas para o bot da plataforma (envio de notificações) (protegidas por HMAC)
+app.use('/platform-api', verifyHmacSignature(), platformApiRoutes);
 
 // ============================================================
 // ✅ TRATAMENTO DE ERROS GLOBAL
@@ -107,7 +149,8 @@ const startServer = () => {
 const shutdown = async (signal) => {
     console.log(`\n[APP] 🛑 ${signal} recebido. Iniciando graceful shutdown...`);
 
-    // 1. Parar o serviço do WhatsApp
+    // 1. Parar processadores e serviços
+    stopDLQProcessor();
     await whatsappService.shutdown();
 
     // 2. Fechar o pool do banco de dados

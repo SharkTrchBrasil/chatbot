@@ -3,13 +3,9 @@
 import {
     checkStoreStatus,
     getCustomMessage,
-    getStoreName,
-    getBusinessHours,
-    getMenuLinkSlug,
-    getActiveCoupons,
-    getStoreAddress,
     getTodaysOrderStatusByPhone
 } from '../services/chatbotService.js';
+import { getStoreReadModel } from '../services/chatReadModel.js';
 
 import {
     replaceVariables,
@@ -103,25 +99,19 @@ export const processMessage = async (msg, storeId, waSocket, state) => {
         }
 
         // ... (lógica de buscar dados da loja e montar variáveis) ...
-        const [storeName, hours, menuSlug, coupons, address] = await Promise.all([
-            getStoreName(storeId),
-            getBusinessHours(storeId),
-            getMenuLinkSlug(storeId),
-            getActiveCoupons(storeId),
-            getStoreAddress(storeId)
-        ]);
+        const rm = await getStoreReadModel(storeId);
 
         const domain = process.env.PLATFORM_DOMAIN || 'menuhub.com.br';
         const variables = {
             'greeting': getGreeting(),
             'client.name': clientName,
-            'company.name': storeName,
-            'company.address': address,
-            'company.url_products': menuSlug ? `https://${menuSlug}.${domain}` : '',
-            'company.url_promotions': menuSlug ? `https://${menuSlug}.${domain}/promocoes` : '',
-            'company.business_hours': hours ? `das ${hours.open_time} às ${hours.close_time}` : 'Consulte nosso site.',
-            'promotions.list': coupons.length > 0
-                ? coupons.map(c => `\n- ${c.code}: ${c.description}`).join('')
+            'company.name': rm.name,
+            'company.address': rm.address,
+            'company.url_products': rm.slug ? `https://${rm.slug}.${domain}` : '',
+            'company.url_promotions': rm.slug ? `https://${rm.slug}.${domain}/promocoes` : '',
+            'company.business_hours': rm.hours ? `das ${rm.hours.open_time} às ${rm.hours.close_time}` : 'Consulte nosso site.',
+            'promotions.list': rm.coupons.length > 0
+                ? rm.coupons.map(c => `\n- ${c.code}: ${c.description}`).join('')
                 : 'Nenhuma promoção ativa no momento.'
         };
 

@@ -10,7 +10,11 @@ class SafeMetricsCollector {
             requestsError: 0,
             messagesProcessed: 0,
             cacheHits: 0,
-            cacheMisses: 0
+            cacheMisses: 0,
+            dlqSaved: 0,
+            dlqReprocessed: 0,
+            dlqRetriesFailed: 0,
+            dlqSize: 0
         };
         this.maxHistory = 100;
         this.responseTimes = [];
@@ -60,6 +64,12 @@ class SafeMetricsCollector {
 }
 
 export const metricsCollector = new SafeMetricsCollector();
+
+// DLQ helpers
+export const recordDlqSaved = () => { metricsCollector.metrics.dlqSaved++; };
+export const recordDlqReprocessed = () => { metricsCollector.metrics.dlqReprocessed++; };
+export const recordDlqRetryFailed = () => { metricsCollector.metrics.dlqRetriesFailed++; };
+export const setDlqSize = (n) => { metricsCollector.metrics.dlqSize = n; };
 
 // ✅ CORRIGIDO: Monitoramento otimizado e sem duplicação
 export const startResourceMonitoring = () => {

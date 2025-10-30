@@ -1,5 +1,5 @@
 // utils/notifications.js
-import axios from 'axios';
+import { postJsonSigned } from './httpClient.js';
 
 const { FASTAPI_URL, CHATBOT_WEBHOOK_SECRET } = process.env;
 
@@ -14,16 +14,10 @@ export const notifyFastAPI = async (payload) => {
     }
 
     try {
-        // ALTERADO: A URL foi corrigida para o endpoint correto do webhook.
         const webhookUrl = `${FASTAPI_URL}/webhooks/chatbot/update`;
-
-        console.log(`Notifying FastAPI at ${webhookUrl} with payload:`, payload);
-        await axios.post(webhookUrl, payload, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Webhook-Secret': CHATBOT_WEBHOOK_SECRET
-            }
-        });
+        const correlationId = payload?.correlationId || `notif-${Date.now()}`;
+        console.log(`Notifying FastAPI at ${webhookUrl}`);
+        await postJsonSigned(webhookUrl, payload, CHATBOT_WEBHOOK_SECRET, correlationId);
     } catch (error) {
         // Melhorando o log de erro para mostrar a resposta completa
         const errorResponse = error.response ? error.response.data : error.message;
